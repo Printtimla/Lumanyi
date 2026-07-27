@@ -22,9 +22,11 @@ export function layout(opts: {
 }): string {
 	const items: Array<{ href: string; label: string }> = opts.user
 		? [
-				{ href: "/", label: "Dashboard" },
+				{ href: "/", label: "Home" },
+				{ href: "/restoration", label: "Restoration" },
+				{ href: "/floors", label: "Floors" },
+				{ href: "/print", label: "Print" },
 				{ href: "/customers", label: "Customers" },
-				{ href: "/jobs", label: "Jobs" },
 				{ href: "/calendar", label: "Calendar" },
 			]
 		: [];
@@ -33,7 +35,6 @@ export function layout(opts: {
 	}
 	if (opts.user) {
 		items.push({ href: "/recurring", label: "Recurring" });
-		items.push({ href: "/print", label: "Print" });
 		items.push({ href: "/print/board", label: "Press board" });
 		items.push({ href: "/tech", label: "Tech" });
 	}
@@ -75,7 +76,7 @@ export function layout(opts: {
     ${opts.body}
   </main>
   <footer class="foot">
-    <span>Internal Field Ops · build ${escapeHtml(new Date().toISOString().slice(0, 10))}</span>
+    <span>Lumanyi · build ${escapeHtml(new Date().toISOString().slice(0, 10))}</span>
   </footer>
 </body>
 </html>`;
@@ -83,10 +84,4 @@ export function layout(opts: {
 
 export function statusLabel(status: string): string {
 	return status.replace(/_/g, " ");
-}
-
-export function jobTypeLabel(type: string): string {
-	if (type === "restoration") return "Water restoration";
-	if (type === "hard_floor") return "Hard floor cleaning";
-	return type;
 }

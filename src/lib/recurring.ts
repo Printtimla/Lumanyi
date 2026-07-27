@@ -1,12 +1,13 @@
-import { CHECKLISTS } from "./checklists";
+import { checklistFor } from "./checklists";
 import { newId } from "./ids";
+import type { FieldJobType } from "./products";
 
 export type RecurringRow = {
 	id: string;
 	customer_id: string;
 	site_id: string | null;
 	title: string;
-	job_type: "restoration" | "hard_floor";
+	job_type: FieldJobType;
 	interval_days: number;
 	next_run_at: string;
 	assigned_user_id: string | null;
@@ -65,8 +66,7 @@ export async function generateDueRecurringJobs(
 				.bind(addDays(row.next_run_at, row.interval_days), row.id),
 		];
 
-		const labels =
-			CHECKLISTS[row.job_type] || CHECKLISTS.hard_floor;
+		const labels = checklistFor(row.job_type);
 		labels.forEach((label, i) => {
 			stmts.push(
 				db

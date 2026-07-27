@@ -1,16 +1,21 @@
 # Lumanyi ROADMAP (manual build)
 
 Work top-to-bottom in this chat. Check off items with `[x]` only after `npm run ci` passes.
-Do not start Print Ops or Xactimate-depth estimating until Field Ops Release 1 is complete.
 **Manual only** — no Cursor Automations / cloud agents unless the owner re-enables them.
 Skip items marked **external** until the owner asks to connect Cloudflare/GitHub again.
 
-## Release 1 — Field Ops MVP (current)
+## Architecture lock
+
+- One shared platform kernel (auth, customers, users, calendar).
+- Three product shells on the home hero: **Restoration & Remediation**, **Hard Floor Cleaning**, **Print Ops**.
+- Restoration uses IICRC-aligned service types (dropdown), not a single “restoration” blob mixed with floors.
+
+## Release 1 — Field Ops MVP
 
 - [x] Project scaffold (Workers + Hono + D1)
 - [x] Auth (cookie session) + seed owner user
 - [x] Customers + sites
-- [x] Jobs (restoration / hard_floor) + status pipeline
+- [x] Jobs + status pipeline
 - [x] Job checklists + field notes
 - [x] Simple estimate / invoice dollar fields
 - [x] Calendar list by day
@@ -32,6 +37,14 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] Job filters by tech / date range
 - [x] CSV export of jobs
 
+## Product split (current)
+
+- [x] Migration: expand restoration service types; map legacy `restoration` → `water_restoration`
+- [x] Per-type checklists (water, drying, microbial, biohazard, odor, hard floor)
+- [x] Home hero with three product cards
+- [x] Nav: Restoration | Floors | Print (+ shared Customers / Calendar / Users / Tech)
+- [x] Product-scoped job lists (`/restoration`, `/floors`) + service-type dropdown
+
 ## Later — Estimating track
 
 - [x] Room / area line-item estimates (internal, not Xactimate)
@@ -49,8 +62,19 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] Quote line items (sync to job estimate)
 - [x] Pickup / delivery method + notes
 
+## Later — Field depth
+
+- [ ] Moisture / equipment logs on restoration jobs
+- [ ] Inventory / equipment tracking
+- [ ] Reporting / CSV depth
+- [ ] Client portal (optional)
+
+## Phase 6 — Multi-brand
+
+- [ ] Separate domains / branding per product — **deferred**
+
 ## Bug triage rules (always)
 
 1. P0 (cannot sign in / schedule / save job): fix same session before new features
 2. P1: fix before the next feature
-3. P2: append to Release 1.1
+3. P2: append to next polish release

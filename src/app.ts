@@ -10,10 +10,9 @@ import {
 	setSessionCookie,
 	type AppUser,
 } from "./lib/auth";
-import { CHECKLISTS } from "./lib/checklists";
+import { checklistFor } from "./lib/checklists";
 import {
 	escapeHtml,
-	jobTypeLabel,
 	layout,
 	money,
 	statusLabel,
@@ -32,6 +31,19 @@ import {
 	syncPrintQuoteTotal,
 } from "./lib/print";
 import { consumeLoginOtp } from "./lib/otp";
+import {
+	FLOOR_TYPES,
+	PRODUCTS,
+	RESTORATION_TYPES,
+	isValidFieldJobType,
+	jobTypeLabel,
+	normalizeJobType,
+} from "./lib/products";
+
+const RESTORATION_SQL_TYPES = [
+	...RESTORATION_TYPES.map((t) => t.value),
+	"restoration",
+] as const;
 
 export type Env = {
 	DB: D1Database;
@@ -100,7 +112,7 @@ app.get("/login", async (c) => {
     <div class="login-wrap">
       <div class="panel stack">
         <h1>Sign in</h1>
-        <p class="muted">Internal Field Ops — water restoration &amp; hard floor cleaning.</p>
+        <p class="muted">Lumanyi — Restoration, Floors, and Print Ops.</p>
         <form method="post" action="/login" class="stack">
           <div>
             <label for="email">Email</label>
@@ -434,26 +446,48 @@ app.get("/", async (c) => {
 			)
 			.join("") || `<tr><td colspan="5" class="muted">No scheduled jobs yet.</td></tr>`;
 
+	const productCards = PRODUCTS.map(
+		(p) => `<a class="product-card" href="${escapeHtml(p.href)}">
+      <h2>${escapeHtml(p.title)}</h2>
+      <p class="muted">${escapeHtml(p.blurb)}</p>
+      <span class="btn">Open</span>
+    </a>`,
+	).join("");
+
 	const body = `
-    <h1>Dashboard</h1>
-    <p class="muted">Field Ops — restoration &amp; hard floor cleaning.</p>
-    <div class="grid" style="margin:1rem 0 1.5rem">
-      <div class="stat"><div class="n">${counts?.pipeline ?? 0}</div><div class="l">Pipeline</div></div>
+    <h1>Lumanyi</h1>
+    <p class="muted">Choose a product. Shared customers, calendar, and users sit underneath.</p>
+    <div class="product-grid">${productCards}</div>
+    <div class="grid" style="margin:1.5rem 0">
+      <div class="stat"><div class="n">${counts?.pipeline ?? 0}</div><div class="l">Field pipeline</div></div>
       <div class="stat"><div class="n">${counts?.scheduled ?? 0}</div><div class="l">Scheduled</div></div>
       <div class="stat"><div class="n">${counts?.active ?? 0}</div><div class="l">In progress</div></div>
       <div class="stat"><div class="n">${counts?.done ?? 0}</div><div class="l">Complete / invoiced</div></div>
     </div>
     <div class="toolbar">
-      <a class="btn" href="/jobs/new">New job</a>
+      <a class="btn" href="/restoration">New restoration job</a>
+      <a class="btn secondary" href="/floors">Floor jobs</a>
       <a class="btn secondary" href="/customers/new">New customer</a>
     </div>
-    <h2>Up next</h2>
+    <h2>Up next (field)</h2>
     <table>
       <thead><tr><th>Job</th><th>Customer</th><th>Type</th><th>Status</th><th>When</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 
-	return c.html(page(c, "Dashboard", body));
+	return c.html(page(c, "Home", body));
+});
+
+app.get("/restoration", async (c) => {
+	const q = new URLSearchParams(c.req.query());
+	q.set("product", "restoration");
+	return c.redirect(`/jobs?${q.toString()}`);
+});
+
+app.get("/floors", async (c) => {
+	const q = new URLSearchParams(c.req.query());
+	q.set("product", "floors");
+	return c.redirect(`/jobs?${q.toString()}`);
 });
 
 app.get("/customers", async (c) => {
@@ -625,7 +659,8 @@ app.get("/customers/:id", async (c) => {
 	const body = `
     <div class="toolbar">
       <div class="grow"><h1 style="margin:0">${escapeHtml(customer.name)}</h1></div>
-      <a class="btn" href="/jobs/new?customer_id=${escapeHtml(customer.id)}">New job</a>
+      <a class="btn" href="/jobs/new?product=restoration&customer_id=${escapeHtml(customer.id)}">New restoration</a>
+      <a class="btn secondary" href="/jobs/new?product=floors&customer_id=${escapeHtml(customer.id)}">New floor job</a>
     </div>
     <div class="panel stack">
       <div><span class="muted">Phone</span><br>${escapeHtml(customer.phone) || "—"}</div>
@@ -647,9 +682,19 @@ app.get("/jobs", async (c) => {
 	const tech = c.req.query("tech") || "";
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
+	const product = c.req.query("product") || "";
 
 	const where: string[] = ["1=1"];
 	const binds: string[] = [];
+	if (product === "restoration") {
+		where.push(
+			`j.job_type IN (${RESTORATION_SQL_TYPES.map(() => "?").join(",")})`,
+		);
+		binds.push(...RESTORATION_SQL_TYPES);
+	} else if (product === "floors") {
+		where.push("j.job_type = ?");
+		binds.push("hard_floor");
+	}
 	if (status) {
 		where.push("j.status = ?");
 		binds.push(status);
@@ -714,6 +759,12 @@ app.get("/jobs", async (c) => {
 			)
 			.join("") || `<tr><td colspan="6" class="muted">No jobs match.</td></tr>`;
 
+	const basePath = "/jobs";
+	const withProduct = (q: URLSearchParams) => {
+		if (product) q.set("product", product);
+		return q;
+	};
+
 	const statusFilters = [
 		"",
 		"lead",
@@ -724,13 +775,13 @@ app.get("/jobs", async (c) => {
 		"invoiced",
 	]
 		.map((s) => {
-			const q = new URLSearchParams();
+			const q = withProduct(new URLSearchParams());
 			if (s) q.set("status", s);
 			if (tech) q.set("tech", tech);
 			if (from) q.set("from", from);
 			if (to) q.set("to", to);
 			const qs = q.toString();
-			const href = qs ? `/jobs?${qs}` : "/jobs";
+			const href = qs ? `${basePath}?${qs}` : basePath;
 			const active = status === s ? "btn" : "btn secondary";
 			return `<a class="${active}" href="${href}">${escapeHtml(statusLabel(s || "all"))}</a>`;
 		})
@@ -744,20 +795,39 @@ app.get("/jobs", async (c) => {
 			)
 			.join("") || "";
 
-	const exportQ = new URLSearchParams();
+	const exportQ = withProduct(new URLSearchParams());
 	if (status) exportQ.set("status", status);
 	if (tech) exportQ.set("tech", tech);
 	if (from) exportQ.set("from", from);
 	if (to) exportQ.set("to", to);
 	const exportHref = `/jobs/export.csv${exportQ.toString() ? `?${exportQ}` : ""}`;
 
+	const clearHref = product ? `/jobs?product=${escapeHtml(product)}` : "/jobs";
+	const heading =
+		product === "restoration"
+			? "Restoration & Remediation"
+			: product === "floors"
+				? "Hard Floor Cleaning"
+				: "All field jobs";
+	const newHref = product
+		? `/jobs/new?product=${escapeHtml(product)}`
+		: "/jobs/new";
+	const blurb =
+		product === "restoration"
+			? "Water restoration, structural drying, microbial remediation, bio-hazard, odor removal."
+			: product === "floors"
+				? "Commercial hard-floor jobs and crew schedules."
+				: "All restoration and floor jobs. Use product nav to narrow.";
+
 	const body = `
     <div class="toolbar">
-      <div class="grow"><h1 style="margin:0">Jobs</h1></div>
+      <div class="grow"><h1 style="margin:0">${escapeHtml(heading)}</h1></div>
       <a class="btn secondary" href="${escapeHtml(exportHref)}">Export CSV</a>
-      <a class="btn" href="/jobs/new">New job</a>
+      <a class="btn" href="${escapeHtml(newHref)}">New job</a>
     </div>
+    <p class="muted">${escapeHtml(blurb)}</p>
     <form class="panel toolbar" method="get" action="/jobs" style="align-items:end">
+      ${product ? `<input type="hidden" name="product" value="${escapeHtml(product)}" />` : ""}
       ${status ? `<input type="hidden" name="status" value="${escapeHtml(status)}" />` : ""}
       <div>
         <label for="tech">Tech</label>
@@ -775,7 +845,7 @@ app.get("/jobs", async (c) => {
         <input id="to" name="to" type="date" value="${escapeHtml(to)}" />
       </div>
       <button class="btn secondary" type="submit">Apply</button>
-      <a class="btn secondary" href="/jobs">Clear</a>
+      <a class="btn secondary" href="${clearHref}">Clear</a>
     </form>
     <div class="toolbar">${statusFilters}</div>
     <table>
@@ -783,7 +853,7 @@ app.get("/jobs", async (c) => {
       <tbody>${rows}</tbody>
     </table>`;
 
-	return c.html(page(c, "Jobs", body));
+	return c.html(page(c, heading, body));
 });
 
 app.get("/jobs/export.csv", async (c) => {
@@ -791,9 +861,19 @@ app.get("/jobs/export.csv", async (c) => {
 	const tech = c.req.query("tech") || "";
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
+	const product = c.req.query("product") || "";
 
 	const where: string[] = ["1=1"];
 	const binds: string[] = [];
+	if (product === "restoration") {
+		where.push(
+			`j.job_type IN (${RESTORATION_SQL_TYPES.map(() => "?").join(",")})`,
+		);
+		binds.push(...RESTORATION_SQL_TYPES);
+	} else if (product === "floors") {
+		where.push("j.job_type = ?");
+		binds.push("hard_floor");
+	}
 	if (status) {
 		where.push("j.status = ?");
 		binds.push(status);
@@ -868,6 +948,7 @@ app.get("/jobs/export.csv", async (c) => {
 
 app.get("/jobs/new", async (c) => {
 	const preselect = c.req.query("customer_id") || "";
+	const product = c.req.query("product") || "";
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
@@ -891,9 +972,35 @@ app.get("/jobs/new", async (c) => {
 			)
 			.join("") || "";
 
+	const typeOptions =
+		product === "floors"
+			? FLOOR_TYPES
+			: product === "restoration"
+				? RESTORATION_TYPES
+				: [...RESTORATION_TYPES, ...FLOOR_TYPES];
+
+	const typeSelect = typeOptions
+		.map(
+			(t, i) =>
+				`<option value="${escapeHtml(t.value)}" ${i === 0 ? "selected" : ""}>${escapeHtml(t.label)}</option>`,
+		)
+		.join("");
+
+	const heading =
+		product === "restoration"
+			? "New restoration job"
+			: product === "floors"
+				? "New floor job"
+				: "New job";
+	const placeholder =
+		product === "floors"
+			? "Lobby hard floor clean"
+			: "Kitchen flood mitigation";
+
 	const body = `
-    <h1>New job</h1>
+    <h1>${escapeHtml(heading)}</h1>
     <form method="post" action="/jobs" class="panel stack">
+      ${product ? `<input type="hidden" name="product" value="${escapeHtml(product)}" />` : ""}
       <div>
         <label for="customer_id">Customer</label>
         <select id="customer_id" name="customer_id" required>
@@ -901,13 +1008,12 @@ app.get("/jobs/new", async (c) => {
           ${options}
         </select>
       </div>
-      <div><label for="title">Title</label><input id="title" name="title" required placeholder="Kitchen flood mitigation" /></div>
+      <div><label for="title">Title</label><input id="title" name="title" required placeholder="${escapeHtml(placeholder)}" /></div>
       <div class="row">
         <div>
-          <label for="job_type">Type</label>
+          <label for="job_type">Service type</label>
           <select id="job_type" name="job_type" required>
-            <option value="restoration">Water restoration</option>
-            <option value="hard_floor">Hard floor cleaning</option>
+            ${typeSelect}
           </select>
         </div>
         <div>
@@ -935,16 +1041,17 @@ app.get("/jobs/new", async (c) => {
       <button class="btn" type="submit">Create job</button>
     </form>`;
 
-	return c.html(page(c, "New job", body));
+	return c.html(page(c, heading, body));
 });
 
 app.post("/jobs", async (c) => {
 	const form = await c.req.parseBody();
 	const customerId = String(form.customer_id || "");
-	const jobType = String(form.job_type || "") as "restoration" | "hard_floor";
-	if (jobType !== "restoration" && jobType !== "hard_floor") {
+	const rawType = String(form.job_type || "");
+	if (!isValidFieldJobType(rawType)) {
 		return c.text("Invalid job type", 400);
 	}
+	const jobType = normalizeJobType(rawType);
 
 	const site = await c.env.DB.prepare(
 		`SELECT id FROM sites WHERE customer_id = ? ORDER BY created_at LIMIT 1`,
@@ -979,7 +1086,7 @@ app.post("/jobs", async (c) => {
 		),
 	];
 
-	CHECKLISTS[jobType].forEach((label, i) => {
+	checklistFor(jobType).forEach((label, i) => {
 		stmts.push(
 			c.env.DB.prepare(
 				`INSERT INTO job_checklist_items (id, job_id, label, sort_order) VALUES (?, ?, ?, ?)`,
@@ -1793,7 +1900,7 @@ app.get("/recurring", async (c) => {
         <button class="btn secondary" type="submit">Generate due jobs</button>
       </form>
     </div>
-    <p class="muted">Hard-floor (and other) contracts. “Generate due jobs” creates scheduled jobs for templates whose next date is today or earlier.</p>
+    <p class="muted">Floor contracts by default. “Generate due jobs” creates scheduled jobs for templates whose next date is today or earlier.</p>
     <table>
       <thead><tr><th>Title</th><th>Customer</th><th>Type</th><th>Cadence</th><th>Next</th><th>Tech</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
@@ -1810,10 +1917,16 @@ app.get("/recurring", async (c) => {
       <div><label for="title">Title</label><input id="title" name="title" required placeholder="Monthly hard floor clean" /></div>
       <div class="row">
         <div>
-          <label for="job_type">Type</label>
+          <label for="job_type">Service type</label>
           <select id="job_type" name="job_type">
-            <option value="hard_floor" selected>Hard floor cleaning</option>
-            <option value="restoration">Water restoration</option>
+            ${FLOOR_TYPES.map(
+							(t) =>
+								`<option value="${escapeHtml(t.value)}" selected>${escapeHtml(t.label)}</option>`,
+						).join("")}
+            ${RESTORATION_TYPES.map(
+							(t) =>
+								`<option value="${escapeHtml(t.value)}">${escapeHtml(t.label)}</option>`,
+						).join("")}
           </select>
         </div>
         <div>
@@ -1848,12 +1961,11 @@ app.get("/recurring", async (c) => {
 app.post("/recurring", async (c) => {
 	const form = await c.req.parseBody();
 	const customerId = String(form.customer_id || "");
-	const jobType = String(form.job_type || "hard_floor") as
-		| "restoration"
-		| "hard_floor";
-	if (jobType !== "restoration" && jobType !== "hard_floor") {
+	const rawType = String(form.job_type || "hard_floor");
+	if (!isValidFieldJobType(rawType)) {
 		return c.text("Invalid job type", 400);
 	}
+	const jobType = normalizeJobType(rawType);
 	const intervalDays = Number(form.interval_days || 0);
 	if (!customerId || !Number.isFinite(intervalDays) || intervalDays < 1) {
 		return c.text("Customer and interval required", 400);
@@ -1893,7 +2005,7 @@ app.post("/recurring/generate", async (c) => {
 			c,
 			"Recurring",
 			`<h1>Generated</h1><p>Created ${created} job(s) from due templates.</p>
-       <p><a class="btn" href="/recurring">Back</a> <a class="btn secondary" href="/jobs?status=scheduled">View scheduled</a></p>`,
+       <p><a class="btn" href="/recurring">Back</a> <a class="btn secondary" href="/floors?status=scheduled">View scheduled floors</a></p>`,
 		),
 	);
 });
@@ -2728,7 +2840,8 @@ app.get("/calendar", async (c) => {
 	const body = `
     <div class="toolbar">
       <div class="grow"><h1 style="margin:0">Calendar</h1></div>
-      <a class="btn" href="/jobs/new">New job</a>
+      <a class="btn" href="/restoration">Restoration</a>
+      <a class="btn secondary" href="/floors">Floors</a>
     </div>
     ${sections}`;
 

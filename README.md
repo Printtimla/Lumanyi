@@ -1,13 +1,12 @@
 # Lumanyi
 
-Internal Field Ops for **water restoration** and **hard floor cleaning**.
-
-Print Ops is a later product on the same platform idea — not in Release 1.
+Internal multi-product ops: **Restoration & Remediation**, **Hard Floor Cleaning**, and **Print Ops** on one shared kernel (auth, customers, calendar, users).
 
 ## Stack
 
 - Cloudflare Workers + Hono
 - D1 (SQLite)
+- R2 (job / print file uploads)
 - Cookie sessions (internal only)
 
 ## Cloudflare
@@ -48,13 +47,6 @@ Default login: `owner@lumanyi.local` / `Lumanyi1!`
 | `npm run ci` | Typecheck + tests |
 | `npm run deploy` | Deploy Worker (needs real D1 id + `wrangler login`) |
 | `npm run db:migrate:local` | Apply D1 migrations locally |
-
-## Cloudflare deploy (first time)
-
-1. `npx wrangler login`
-2. `npx wrangler d1 create lumanyi` — paste the `database_id` into `wrangler.jsonc`
-3. `npx wrangler d1 migrations apply lumanyi --remote`
-4. `npm run deploy`
 
 ## Automation
 

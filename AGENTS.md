@@ -12,13 +12,14 @@ https://developers.cloudflare.com/d1/
 
 ## Product boundary
 
-- This repo is **Field Ops** (water restoration + hard floor cleaning).
-- Do **not** build Print Ops UI here until ROADMAP says so.
+- One kernel + three product shells: **Restoration & Remediation**, **Hard Floor Cleaning**, **Print Ops**.
+- Restoration service types live in `src/lib/products.ts` (IICRC-aligned dropdown).
+- Do **not** mix floors into restoration job lists, or invent taxonomy outside `products.ts` / `data` equivalents.
 - Do **not** claim Xactimate parity; estimating track is internal line items only.
 
 ## Work style
 
-1. Read `ROADMAP.md` — take the next unchecked **non-external** Release 1 item.
+1. Read `ROADMAP.md` — take the next unchecked **non-external** item.
 2. Implement the smallest useful change.
 3. Run `npm run ci`.
 4. Update ROADMAP checkboxes when done.
