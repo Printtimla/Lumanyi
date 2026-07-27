@@ -23,10 +23,13 @@ import { hashPassword, verifyPassword } from "./lib/password";
 import { generateDueRecurringJobs } from "./lib/recurring";
 import { buildEstimatePdf, syncJobEstimateTotal } from "./lib/estimate";
 import {
+	PRINT_BOARD_COLUMNS,
+	PRINT_FILE_KINDS,
 	PRINT_PRODUCT_TYPES,
 	PRINT_STATUSES,
 	printProductLabel,
 	printStatusLabel,
+	syncPrintQuoteTotal,
 } from "./lib/print";
 import { consumeLoginOtp } from "./lib/otp";
 
@@ -1955,7 +1958,7 @@ app.get("/print", async (c) => {
 		.map((s) => {
 			const href = s ? `/print?status=${s}` : "/print";
 			const active = status === s ? "btn" : "btn secondary";
-			const label = s ? printStatusLabel(s) : "Open board";
+			const label = s ? printStatusLabel(s) : "All open";
 			return `<a class="${active}" href="${href}">${escapeHtml(label)}</a>`;
 		})
 		.join(" ");
@@ -1964,8 +1967,9 @@ app.get("/print", async (c) => {
     <div class="toolbar">
       <div class="grow">
         <h1 style="margin:0">Print Ops</h1>
-        <p class="muted" style="margin:0.35rem 0 0">Separate product shell — not Field Ops restoration/cleaning jobs.</p>
+        <p class="muted" style="margin:0.35rem 0 0">Proof → production → pickup/delivery. Separate from Field Ops.</p>
       </div>
+      <a class="btn secondary" href="/print/board">Press board</a>
       <a class="btn" href="/print/new">New print job</a>
     </div>
     <div class="toolbar">${filters}</div>
@@ -1975,6 +1979,65 @@ app.get("/print", async (c) => {
     </table>`;
 
 	return c.html(page(c, "Print Ops", body));
+});
+
+app.get("/print/board", async (c) => {
+	const list = await c.env.DB.prepare(
+		`SELECT p.id, p.title, p.product_type, p.status, p.quantity, p.due_date, p.revise_count,
+      c.name AS customer_name
+     FROM print_jobs p
+     LEFT JOIN customers c ON c.id = p.customer_id
+     WHERE p.status IN ('intake','proof','approved','in_production','ready')
+     ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
+     LIMIT 200`,
+	).all<{
+		id: string;
+		title: string;
+		product_type: string;
+		status: string;
+		quantity: number | null;
+		due_date: string | null;
+		revise_count: number;
+		customer_name: string | null;
+	}>();
+
+	const byStatus = new Map<string, typeof list.results>();
+	for (const col of PRINT_BOARD_COLUMNS) byStatus.set(col, []);
+	for (const job of list.results || []) {
+		const bucket = byStatus.get(job.status);
+		if (bucket) bucket.push(job);
+	}
+
+	const columns = PRINT_BOARD_COLUMNS.map((col) => {
+		const cards = (byStatus.get(col) || [])
+			.map(
+				(j) => `<a class="panel stack" href="/print/${escapeHtml(j.id)}"
+          style="color:inherit;text-decoration:none;padding:0.75rem;margin-bottom:0.5rem;display:block">
+          <strong>${escapeHtml(j.title)}</strong>
+          <div class="muted" style="font-size:0.85rem">${escapeHtml(j.customer_name) || "Walk-in"} · ${escapeHtml(printProductLabel(j.product_type))}</div>
+          <div class="muted" style="font-size:0.85rem">Qty ${j.quantity ?? "—"} · Due ${escapeHtml(j.due_date) || "—"}</div>
+          ${j.revise_count > 0 ? `<div class="muted" style="font-size:0.8rem">Revises: ${j.revise_count}</div>` : ""}
+        </a>`,
+			)
+			.join("") || `<p class="muted" style="font-size:0.85rem">Empty</p>`;
+		return `<div class="panel" style="min-width:180px;flex:1">
+      <h2 style="margin:0 0 0.75rem;font-size:0.95rem">${escapeHtml(printStatusLabel(col))}</h2>
+      ${cards}
+    </div>`;
+	}).join("");
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow">
+        <h1 style="margin:0">Press board</h1>
+        <p class="muted" style="margin:0.35rem 0 0">Production queue by status.</p>
+      </div>
+      <a class="btn secondary" href="/print">List view</a>
+      <a class="btn" href="/print/new">New print job</a>
+    </div>
+    <div style="display:flex;gap:0.75rem;overflow-x:auto;align-items:flex-start;margin-top:1rem">${columns}</div>`;
+
+	return c.html(page(c, "Press board", body));
 });
 
 app.get("/print/new", async (c) => {
@@ -2023,15 +2086,24 @@ app.get("/print/new", async (c) => {
         <div><label for="quantity">Quantity</label><input id="quantity" name="quantity" type="number" min="1" /></div>
         <div><label for="due_date">Due date</label><input id="due_date" name="due_date" type="date" /></div>
       </div>
-      <div>
-        <label for="assigned_user_id">Assigned to</label>
-        <select id="assigned_user_id" name="assigned_user_id">
-          <option value="">Unassigned</option>
-          ${staffOptions}
-        </select>
+      <div class="row">
+        <div>
+          <label for="assigned_user_id">Assigned to</label>
+          <select id="assigned_user_id" name="assigned_user_id">
+            <option value="">Unassigned</option>
+            ${staffOptions}
+          </select>
+        </div>
+        <div>
+          <label for="delivery_method">Pickup / delivery</label>
+          <select id="delivery_method" name="delivery_method">
+            <option value="">TBD</option>
+            <option value="pickup">Pickup</option>
+            <option value="delivery">Delivery</option>
+          </select>
+        </div>
       </div>
       <div><label for="specs">Specs</label><textarea id="specs" name="specs" placeholder="Size, stock, color, finish, fold…"></textarea></div>
-      <div><label for="estimate_dollars">Estimate ($)</label><input id="estimate_dollars" name="estimate_dollars" type="number" step="0.01" min="0" /></div>
       <div><label for="notes">Notes</label><textarea id="notes" name="notes"></textarea></div>
       <button class="btn" type="submit">Create print job</button>
     </form>`;
@@ -2045,13 +2117,16 @@ app.post("/print", async (c) => {
 	if (!PRINT_PRODUCT_TYPES.some((p) => p.value === productType)) {
 		return c.text("Invalid product type", 400);
 	}
+	const deliveryMethod = String(form.delivery_method || "").trim();
+	if (deliveryMethod && deliveryMethod !== "pickup" && deliveryMethod !== "delivery") {
+		return c.text("Invalid delivery method", 400);
+	}
 	const qtyRaw = String(form.quantity || "").trim();
-	const estimateRaw = String(form.estimate_dollars || "").trim();
 	const id = newId("prj");
 	await c.env.DB.prepare(
 		`INSERT INTO print_jobs (
       id, customer_id, title, product_type, status, quantity, specs, due_date,
-      estimate_cents, notes, assigned_user_id
+      notes, assigned_user_id, delivery_method
     ) VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?, ?)`,
 	)
 		.bind(
@@ -2062,9 +2137,9 @@ app.post("/print", async (c) => {
 			qtyRaw ? Number(qtyRaw) : null,
 			String(form.specs || "").trim() || null,
 			String(form.due_date || "").trim() || null,
-			estimateRaw ? Math.round(parseFloat(estimateRaw) * 100) : null,
 			String(form.notes || "").trim() || null,
 			String(form.assigned_user_id || "").trim() || null,
+			deliveryMethod || null,
 		)
 		.run();
 	return c.redirect(`/print/${id}`);
@@ -2090,6 +2165,10 @@ app.get("/print/:id", async (c) => {
 			due_date: string | null;
 			estimate_cents: number | null;
 			notes: string | null;
+			proof_notes: string | null;
+			delivery_method: string | null;
+			delivery_notes: string | null;
+			revise_count: number;
 			customer_id: string | null;
 			customer_name: string | null;
 			assigned_user_id: string | null;
@@ -2103,6 +2182,23 @@ app.get("/print/:id", async (c) => {
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
+	const files = await c.env.DB.prepare(
+		`SELECT id, kind, filename, created_at FROM print_files
+     WHERE print_job_id = ? ORDER BY created_at DESC`,
+	)
+		.bind(id)
+		.all<{ id: string; kind: string; filename: string; created_at: string }>();
+	const lines = await c.env.DB.prepare(
+		`SELECT * FROM print_quote_lines WHERE print_job_id = ? ORDER BY sort_order, description`,
+	)
+		.bind(id)
+		.all<{
+			id: string;
+			description: string;
+			quantity: number;
+			unit: string;
+			unit_cents: number;
+		}>();
 
 	const statusOptions = PRINT_STATUSES.map(
 		(s) =>
@@ -2126,6 +2222,69 @@ app.get("/print/:id", async (c) => {
 					`<option value="${escapeHtml(cu.id)}" ${job.customer_id === cu.id ? "selected" : ""}>${escapeHtml(cu.name)}</option>`,
 			)
 			.join("") || "";
+	const kindOptions = PRINT_FILE_KINDS.map(
+		(k) => `<option value="${k.value}">${escapeHtml(k.label)}</option>`,
+	).join("");
+
+	const fileItems =
+		files.results
+			?.map(
+				(f) => `<li style="display:flex;gap:0.75rem;align-items:center;padding:0.35rem 0;border-bottom:1px solid var(--line)">
+        <span class="badge">${escapeHtml(f.kind)}</span>
+        <a href="/print/${escapeHtml(id)}/files/${escapeHtml(f.id)}" target="_blank" rel="noopener">${escapeHtml(f.filename)}</a>
+        <form method="post" action="/print/${escapeHtml(id)}/files/${escapeHtml(f.id)}/delete" class="inline"
+          onsubmit="return confirm('Delete this file?');">
+          <button class="linkish" type="submit">Delete</button>
+        </form>
+      </li>`,
+			)
+			.join("") || `<li class="muted">No files yet.</li>`;
+
+	const lineRows =
+		lines.results
+			?.map((l) => {
+				const total = Math.round(l.quantity * l.unit_cents);
+				return `<tr>
+        <td>${escapeHtml(l.description)}</td>
+        <td>${escapeHtml(l.quantity)} ${escapeHtml(l.unit)}</td>
+        <td>${escapeHtml(money(l.unit_cents))}</td>
+        <td>${escapeHtml(money(total))}</td>
+        <td>
+          <form method="post" action="/print/${escapeHtml(id)}/quote/${escapeHtml(l.id)}/delete" class="inline">
+            <button class="linkish" type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>`;
+			})
+			.join("") || `<tr><td colspan="5" class="muted">No quote lines yet.</td></tr>`;
+
+	const proofActions = `
+    <div class="toolbar" style="flex-wrap:wrap">
+      <form method="post" action="/print/${escapeHtml(id)}/workflow" class="inline">
+        <input type="hidden" name="action" value="send_proof" />
+        <button class="btn secondary" type="submit">Send to proof</button>
+      </form>
+      <form method="post" action="/print/${escapeHtml(id)}/workflow" class="inline">
+        <input type="hidden" name="action" value="request_revise" />
+        <button class="btn secondary" type="submit">Request revise</button>
+      </form>
+      <form method="post" action="/print/${escapeHtml(id)}/workflow" class="inline">
+        <input type="hidden" name="action" value="approve" />
+        <button class="btn secondary" type="submit">Approve proof</button>
+      </form>
+      <form method="post" action="/print/${escapeHtml(id)}/workflow" class="inline">
+        <input type="hidden" name="action" value="start_production" />
+        <button class="btn secondary" type="submit">Start production</button>
+      </form>
+      <form method="post" action="/print/${escapeHtml(id)}/workflow" class="inline">
+        <input type="hidden" name="action" value="mark_ready" />
+        <button class="btn secondary" type="submit">Mark ready</button>
+      </form>
+      <form method="post" action="/print/${escapeHtml(id)}/workflow" class="inline">
+        <input type="hidden" name="action" value="mark_delivered" />
+        <button class="btn" type="submit">Mark delivered / picked up</button>
+      </form>
+    </div>`;
 
 	const body = `
     <div class="toolbar">
@@ -2134,18 +2293,27 @@ app.get("/print/:id", async (c) => {
         <p class="muted" style="margin:0.35rem 0 0">
           Print Ops · ${escapeHtml(printProductLabel(job.product_type))}
           · <span class="badge ${escapeHtml(job.status)}">${escapeHtml(printStatusLabel(job.status))}</span>
+          ${job.revise_count > 0 ? ` · Revises: ${job.revise_count}` : ""}
         </p>
       </div>
+      <a class="btn secondary" href="/print/board">Press board</a>
       <a class="btn secondary" href="/print">All print jobs</a>
     </div>
+
+    <h2>Proof &amp; production</h2>
+    ${proofActions}
+
     <div class="row" style="margin-top:1rem">
       <div class="panel stack">
         <div><span class="muted">Customer</span><br>${escapeHtml(job.customer_name) || "—"}</div>
         <div><span class="muted">Assigned</span><br>${escapeHtml(job.assignee_name) || "Unassigned"}</div>
         <div><span class="muted">Quantity</span><br>${job.quantity ?? "—"}</div>
         <div><span class="muted">Due</span><br>${escapeHtml(job.due_date) || "—"}</div>
-        <div><span class="muted">Estimate</span><br>${escapeHtml(money(job.estimate_cents))}</div>
+        <div><span class="muted">Quote total</span><br>${escapeHtml(money(job.estimate_cents))}</div>
+        <div><span class="muted">Pickup / delivery</span><br>${escapeHtml(job.delivery_method) || "TBD"}</div>
         ${job.specs ? `<div><span class="muted">Specs</span><br>${escapeHtml(job.specs)}</div>` : ""}
+        ${job.proof_notes ? `<div><span class="muted">Proof notes</span><br>${escapeHtml(job.proof_notes)}</div>` : ""}
+        ${job.delivery_notes ? `<div><span class="muted">Delivery notes</span><br>${escapeHtml(job.delivery_notes)}</div>` : ""}
         ${job.notes ? `<div><span class="muted">Notes</span><br>${escapeHtml(job.notes)}</div>` : ""}
       </div>
       <div class="panel stack">
@@ -2181,16 +2349,54 @@ app.get("/print/:id", async (c) => {
               <input id="quantity" name="quantity" type="number" min="1" value="${job.quantity ?? ""}" /></div>
             <div><label for="due_date">Due date</label>
               <input id="due_date" name="due_date" type="date" value="${escapeHtml(job.due_date)}" /></div>
-            <div><label for="estimate_dollars">Estimate ($)</label>
-              <input id="estimate_dollars" name="estimate_dollars" type="number" step="0.01" min="0"
-                value="${job.estimate_cents != null ? (job.estimate_cents / 100).toFixed(2) : ""}" /></div>
+            <div>
+              <label for="delivery_method">Pickup / delivery</label>
+              <select id="delivery_method" name="delivery_method">
+                <option value="" ${!job.delivery_method ? "selected" : ""}>TBD</option>
+                <option value="pickup" ${job.delivery_method === "pickup" ? "selected" : ""}>Pickup</option>
+                <option value="delivery" ${job.delivery_method === "delivery" ? "selected" : ""}>Delivery</option>
+              </select>
+            </div>
           </div>
           <div><label for="specs">Specs</label><textarea id="specs" name="specs">${escapeHtml(job.specs)}</textarea></div>
-          <div><label for="notes">Notes</label><textarea id="notes" name="notes">${escapeHtml(job.notes)}</textarea></div>
+          <div><label for="proof_notes">Proof notes</label><textarea id="proof_notes" name="proof_notes" placeholder="Client feedback, revise instructions…">${escapeHtml(job.proof_notes)}</textarea></div>
+          <div><label for="delivery_notes">Delivery / pickup notes</label><textarea id="delivery_notes" name="delivery_notes" placeholder="Address, contact, dock hours…">${escapeHtml(job.delivery_notes)}</textarea></div>
+          <div><label for="notes">Internal notes</label><textarea id="notes" name="notes">${escapeHtml(job.notes)}</textarea></div>
           <button class="btn" type="submit">Save</button>
         </form>
       </div>
-    </div>`;
+    </div>
+
+    <h2>Files</h2>
+    <form method="post" action="/print/${escapeHtml(id)}/files" enctype="multipart/form-data" class="panel stack" style="margin-bottom:0.75rem">
+      <div class="row">
+        <div>
+          <label for="kind">Kind</label>
+          <select id="kind" name="kind">${kindOptions}</select>
+        </div>
+        <div>
+          <label for="file">File (max 25 MB)</label>
+          <input id="file" name="file" type="file" required />
+        </div>
+      </div>
+      <button class="btn" type="submit">Upload</button>
+    </form>
+    <ul class="checklist">${fileItems}</ul>
+
+    <h2>Quote lines</h2>
+    <table>
+      <thead><tr><th>Description</th><th>Qty</th><th>Unit $</th><th>Total</th><th></th></tr></thead>
+      <tbody>${lineRows}</tbody>
+    </table>
+    <form method="post" action="/print/${escapeHtml(id)}/quote" class="panel stack" style="margin-top:0.75rem">
+      <div class="row">
+        <div><label for="description">Description</label><input id="description" name="description" required placeholder="4/4 100# cover, 5.5x8.5" /></div>
+        <div><label for="quantity">Qty</label><input id="quantity" name="quantity" type="number" step="0.01" min="0" value="1" required /></div>
+        <div><label for="unit">Unit</label><input id="unit" name="unit" value="ea" required /></div>
+        <div><label for="unit_dollars">Unit price ($)</label><input id="unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" value="0" required /></div>
+      </div>
+      <button class="btn" type="submit">Add line</button>
+    </form>`;
 
 	return c.html(page(c, job.title, body));
 });
@@ -2200,18 +2406,22 @@ app.post("/print/:id", async (c) => {
 	const form = await c.req.parseBody();
 	const productType = String(form.product_type || "");
 	const status = String(form.status || "");
+	const deliveryMethod = String(form.delivery_method || "").trim();
 	if (!PRINT_PRODUCT_TYPES.some((p) => p.value === productType)) {
 		return c.text("Invalid product type", 400);
 	}
 	if (!PRINT_STATUSES.some((s) => s.value === status)) {
 		return c.text("Invalid status", 400);
 	}
+	if (deliveryMethod && deliveryMethod !== "pickup" && deliveryMethod !== "delivery") {
+		return c.text("Invalid delivery method", 400);
+	}
 	const qtyRaw = String(form.quantity || "").trim();
-	const estimateRaw = String(form.estimate_dollars || "").trim();
 	await c.env.DB.prepare(
 		`UPDATE print_jobs SET
       customer_id = ?, title = ?, product_type = ?, status = ?, quantity = ?,
-      specs = ?, due_date = ?, estimate_cents = ?, notes = ?, assigned_user_id = ?,
+      specs = ?, due_date = ?, notes = ?, assigned_user_id = ?,
+      proof_notes = ?, delivery_method = ?, delivery_notes = ?,
       updated_at = datetime('now')
      WHERE id = ?`,
 	)
@@ -2223,12 +2433,194 @@ app.post("/print/:id", async (c) => {
 			qtyRaw ? Number(qtyRaw) : null,
 			String(form.specs || "").trim() || null,
 			String(form.due_date || "").trim() || null,
-			estimateRaw ? Math.round(parseFloat(estimateRaw) * 100) : null,
 			String(form.notes || "").trim() || null,
 			String(form.assigned_user_id || "").trim() || null,
+			String(form.proof_notes || "").trim() || null,
+			deliveryMethod || null,
+			String(form.delivery_notes || "").trim() || null,
 			id,
 		)
 		.run();
+	return c.redirect(`/print/${id}`);
+});
+
+app.post("/print/:id/workflow", async (c) => {
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const action = String(form.action || "");
+	const job = await c.env.DB.prepare(
+		`SELECT status, revise_count FROM print_jobs WHERE id = ?`,
+	)
+		.bind(id)
+		.first<{ status: string; revise_count: number }>();
+	if (!job) return c.notFound();
+
+	let status = job.status;
+	let reviseCount = job.revise_count;
+	switch (action) {
+		case "send_proof":
+			status = "proof";
+			break;
+		case "request_revise":
+			status = "proof";
+			reviseCount = (job.revise_count || 0) + 1;
+			break;
+		case "approve":
+			status = "approved";
+			break;
+		case "start_production":
+			status = "in_production";
+			break;
+		case "mark_ready":
+			status = "ready";
+			break;
+		case "mark_delivered":
+			status = "delivered";
+			break;
+		default:
+			return c.text("Unknown action", 400);
+	}
+
+	await c.env.DB.prepare(
+		`UPDATE print_jobs SET status = ?, revise_count = ?, updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(status, reviseCount, id)
+		.run();
+	return c.redirect(`/print/${id}`);
+});
+
+const MAX_PRINT_FILE_BYTES = 25 * 1024 * 1024;
+
+app.post("/print/:id/files", async (c) => {
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(`SELECT id FROM print_jobs WHERE id = ?`)
+		.bind(id)
+		.first();
+	if (!job) return c.notFound();
+
+	const form = await c.req.parseBody();
+	const kind = String(form.kind || "artwork");
+	if (!PRINT_FILE_KINDS.some((k) => k.value === kind)) {
+		return c.text("Invalid file kind", 400);
+	}
+	const file = form.file;
+	if (!file || !(file instanceof File)) {
+		return c.text("File required", 400);
+	}
+	if (file.size > MAX_PRINT_FILE_BYTES) {
+		return c.text("File must be 25 MB or smaller", 400);
+	}
+
+	const fileId = newId("pfl");
+	const safeName =
+		file.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "upload.bin";
+	const r2Key = `print/${id}/${fileId}/${safeName}`;
+	const bytes = new Uint8Array(await file.arrayBuffer());
+	await c.env.UPLOADS.put(r2Key, bytes, {
+		httpMetadata: { contentType: file.type || "application/octet-stream" },
+		customMetadata: { printJobId: id, fileId, filename: safeName, kind },
+	});
+	await c.env.DB.prepare(
+		`INSERT INTO print_files (id, print_job_id, kind, r2_key, filename, content_type, size_bytes, uploaded_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			fileId,
+			id,
+			kind,
+			r2Key,
+			safeName,
+			file.type || null,
+			file.size,
+			c.get("user").id,
+		)
+		.run();
+	await c.env.DB.prepare(
+		`UPDATE print_jobs SET updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/print/${id}`);
+});
+
+app.get("/print/:id/files/:fileId", async (c) => {
+	const id = c.req.param("id");
+	const fileId = c.req.param("fileId");
+	const row = await c.env.DB.prepare(
+		`SELECT r2_key, content_type, filename FROM print_files WHERE id = ? AND print_job_id = ?`,
+	)
+		.bind(fileId, id)
+		.first<{ r2_key: string; content_type: string | null; filename: string }>();
+	if (!row) return c.notFound();
+	const obj = await c.env.UPLOADS.get(row.r2_key);
+	if (!obj) return c.notFound();
+	const headers = new Headers();
+	headers.set(
+		"Content-Type",
+		row.content_type || obj.httpMetadata?.contentType || "application/octet-stream",
+	);
+	headers.set(
+		"Content-Disposition",
+		`inline; filename="${row.filename.replace(/"/g, "")}"`,
+	);
+	return new Response(obj.body, { headers });
+});
+
+app.post("/print/:id/files/:fileId/delete", async (c) => {
+	const id = c.req.param("id");
+	const fileId = c.req.param("fileId");
+	const row = await c.env.DB.prepare(
+		`SELECT r2_key FROM print_files WHERE id = ? AND print_job_id = ?`,
+	)
+		.bind(fileId, id)
+		.first<{ r2_key: string }>();
+	if (!row) return c.notFound();
+	await c.env.UPLOADS.delete(row.r2_key);
+	await c.env.DB.prepare(
+		`DELETE FROM print_files WHERE id = ? AND print_job_id = ?`,
+	)
+		.bind(fileId, id)
+		.run();
+	return c.redirect(`/print/${id}`);
+});
+
+app.post("/print/:id/quote", async (c) => {
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const quantity = parseFloat(String(form.quantity || "1"));
+	const unitDollars = parseFloat(String(form.unit_dollars || "0"));
+	const count = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS c FROM print_quote_lines WHERE print_job_id = ?`,
+	)
+		.bind(id)
+		.first<{ c: number }>();
+	await c.env.DB.prepare(
+		`INSERT INTO print_quote_lines (id, print_job_id, description, quantity, unit, unit_cents, sort_order)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			newId("pql"),
+			id,
+			String(form.description || "").trim(),
+			Number.isFinite(quantity) ? quantity : 1,
+			String(form.unit || "ea").trim() || "ea",
+			Number.isFinite(unitDollars) ? Math.round(unitDollars * 100) : 0,
+			count?.c ?? 0,
+		)
+		.run();
+	await syncPrintQuoteTotal(c.env.DB, id);
+	return c.redirect(`/print/${id}`);
+});
+
+app.post("/print/:id/quote/:lineId/delete", async (c) => {
+	const id = c.req.param("id");
+	const lineId = c.req.param("lineId");
+	await c.env.DB.prepare(
+		`DELETE FROM print_quote_lines WHERE id = ? AND print_job_id = ?`,
+	)
+		.bind(lineId, id)
+		.run();
+	await syncPrintQuoteTotal(c.env.DB, id);
 	return c.redirect(`/print/${id}`);
 });
 

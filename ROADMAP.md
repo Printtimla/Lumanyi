@@ -43,6 +43,11 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 
 - [x] Print job types + production statuses
 - [x] Print Ops nav shell (`/print`) separate from Field Ops jobs
+- [x] Proof workflow (send / revise / approve) + revise count
+- [x] Press / production board (`/print/board`)
+- [x] File uploads on print jobs (R2)
+- [x] Quote line items (sync to job estimate)
+- [x] Pickup / delivery method + notes
 
 ## Bug triage rules (always)
 
