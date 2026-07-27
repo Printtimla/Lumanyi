@@ -34,10 +34,10 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 
 ## Later — Estimating track
 
-- [ ] Room / area line-item estimates (internal, not Xactimate)
-- [ ] Claim fields (claim #, carrier, date of loss)
-- [ ] Estimate PDF
-- [ ] Evaluate Xactimate import/export only after vendor terms verified
+- [x] Room / area line-item estimates (internal, not Xactimate)
+- [x] Claim fields (claim #, carrier, date of loss)
+- [x] Estimate PDF
+- [ ] Evaluate Xactimate import/export only after vendor terms verified — **deferred**
 
 ## Later — Print Ops (separate product shell)
 

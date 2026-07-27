@@ -21,6 +21,7 @@ import {
 import { newId } from "./lib/ids";
 import { hashPassword, verifyPassword } from "./lib/password";
 import { generateDueRecurringJobs } from "./lib/recurring";
+import { buildEstimatePdf, syncJobEstimateTotal } from "./lib/estimate";
 
 export type Env = {
 	DB: D1Database;
@@ -977,6 +978,9 @@ app.get("/jobs/:id", async (c) => {
 			estimate_cents: number | null;
 			invoice_cents: number | null;
 			notes: string | null;
+			claim_number: string | null;
+			carrier: string | null;
+			date_of_loss: string | null;
 			customer_id: string;
 			customer_name: string;
 			assigned_user_id: string | null;
@@ -1062,6 +1066,8 @@ app.get("/jobs/:id", async (c) => {
           · <span class="badge ${escapeHtml(job.status)}">${escapeHtml(statusLabel(job.status))}</span>
         </p>
       </div>
+      <a class="btn secondary" href="/jobs/${escapeHtml(id)}/estimate">Estimate</a>
+      <a class="btn secondary" href="/jobs/${escapeHtml(id)}/estimate.pdf">PDF</a>
     </div>
 
     <div class="row" style="margin-top:1rem">
@@ -1074,8 +1080,11 @@ app.get("/jobs/:id", async (c) => {
           ${escapeHtml(job.scheduled_start ? job.scheduled_start.slice(0, 16).replace("T", " ") : "Not scheduled")}
           ${job.scheduled_end ? ` → ${escapeHtml(job.scheduled_end.slice(0, 16).replace("T", " "))}` : ""}
         </div>
-        <div><span class="muted">Estimate</span><br>${escapeHtml(money(job.estimate_cents))}</div>
+        <div><span class="muted">Estimate</span><br>${escapeHtml(money(job.estimate_cents))} <a href="/jobs/${escapeHtml(id)}/estimate">edit lines</a></div>
         <div><span class="muted">Invoice</span><br>${escapeHtml(money(job.invoice_cents))}</div>
+        <div><span class="muted">Claim #</span><br>${escapeHtml(job.claim_number) || "—"}</div>
+        <div><span class="muted">Carrier</span><br>${escapeHtml(job.carrier) || "—"}</div>
+        <div><span class="muted">Date of loss</span><br>${escapeHtml(job.date_of_loss) || "—"}</div>
         ${job.notes ? `<div><span class="muted">Job notes</span><br>${escapeHtml(job.notes)}</div>` : ""}
       </div>
 
@@ -1109,6 +1118,15 @@ app.get("/jobs/:id", async (c) => {
               <input id="invoice_dollars" name="invoice_dollars" type="number" step="0.01" min="0"
                 value="${job.invoice_cents != null ? (job.invoice_cents / 100).toFixed(2) : ""}" /></div>
           </div>
+          <h2 style="margin:0.5rem 0 0">Claim</h2>
+          <div class="row">
+            <div><label for="claim_number">Claim #</label>
+              <input id="claim_number" name="claim_number" value="${escapeHtml(job.claim_number)}" /></div>
+            <div><label for="carrier">Carrier</label>
+              <input id="carrier" name="carrier" value="${escapeHtml(job.carrier)}" /></div>
+            <div><label for="date_of_loss">Date of loss</label>
+              <input id="date_of_loss" name="date_of_loss" type="date" value="${escapeHtml(job.date_of_loss)}" /></div>
+          </div>
           <button class="btn" type="submit">Save</button>
         </form>
       </div>
@@ -1140,6 +1158,9 @@ app.post("/jobs/:id", async (c) => {
       scheduled_end = ?,
       estimate_cents = ?,
       invoice_cents = ?,
+      claim_number = ?,
+      carrier = ?,
+      date_of_loss = ?,
       updated_at = datetime('now')
      WHERE id = ?`,
 	)
@@ -1150,10 +1171,358 @@ app.post("/jobs/:id", async (c) => {
 			String(form.scheduled_end || "").trim() || null,
 			estimateRaw ? Math.round(parseFloat(estimateRaw) * 100) : null,
 			invoiceRaw ? Math.round(parseFloat(invoiceRaw) * 100) : null,
+			String(form.claim_number || "").trim() || null,
+			String(form.carrier || "").trim() || null,
+			String(form.date_of_loss || "").trim() || null,
 			id,
 		)
 		.run();
 	return c.redirect(`/jobs/${id}`);
+});
+
+app.get("/jobs/:id/estimate", async (c) => {
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.estimate_cents, j.claim_number, j.carrier, j.date_of_loss,
+      c.name AS customer_name
+     FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = ?`,
+	)
+		.bind(id)
+		.first<{
+			id: string;
+			title: string;
+			estimate_cents: number | null;
+			claim_number: string | null;
+			carrier: string | null;
+			date_of_loss: string | null;
+			customer_name: string;
+		}>();
+	if (!job) return c.notFound();
+
+	const rooms = await c.env.DB.prepare(
+		`SELECT * FROM estimate_rooms WHERE job_id = ? ORDER BY sort_order, name`,
+	)
+		.bind(id)
+		.all<{
+			id: string;
+			name: string;
+			length_ft: number | null;
+			width_ft: number | null;
+			height_ft: number | null;
+			notes: string | null;
+		}>();
+
+	const lines = await c.env.DB.prepare(
+		`SELECT l.*, r.name AS room_name
+     FROM estimate_lines l
+     LEFT JOIN estimate_rooms r ON r.id = l.room_id
+     WHERE l.job_id = ?
+     ORDER BY l.sort_order, l.description`,
+	)
+		.bind(id)
+		.all<{
+			id: string;
+			room_id: string | null;
+			room_name: string | null;
+			description: string;
+			quantity: number;
+			unit: string;
+			unit_cents: number;
+		}>();
+
+	const roomRows =
+		rooms.results
+			?.map((r) => {
+				const dims = [r.length_ft, r.width_ft, r.height_ft]
+					.filter((v) => v != null)
+					.join(" × ");
+				return `<tr>
+        <td>${escapeHtml(r.name)}</td>
+        <td>${escapeHtml(dims || "—")}</td>
+        <td>${escapeHtml(r.notes) || "—"}</td>
+        <td>
+          <form method="post" action="/jobs/${escapeHtml(id)}/estimate/rooms/${escapeHtml(r.id)}/delete" class="inline"
+            onsubmit="return confirm('Delete room? Lines stay unassigned.');">
+            <button class="linkish" type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>`;
+			})
+			.join("") || `<tr><td colspan="4" class="muted">No rooms yet.</td></tr>`;
+
+	const lineRows =
+		lines.results
+			?.map((l) => {
+				const total = Math.round(l.quantity * l.unit_cents);
+				return `<tr>
+        <td>${escapeHtml(l.room_name) || "—"}</td>
+        <td>${escapeHtml(l.description)}</td>
+        <td>${escapeHtml(l.quantity)} ${escapeHtml(l.unit)}</td>
+        <td>${escapeHtml(money(l.unit_cents))}</td>
+        <td>${escapeHtml(money(total))}</td>
+        <td>
+          <form method="post" action="/jobs/${escapeHtml(id)}/estimate/lines/${escapeHtml(l.id)}/delete" class="inline">
+            <button class="linkish" type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>`;
+			})
+			.join("") || `<tr><td colspan="6" class="muted">No line items yet.</td></tr>`;
+
+	const roomOptions =
+		rooms.results
+			?.map(
+				(r) =>
+					`<option value="${escapeHtml(r.id)}">${escapeHtml(r.name)}</option>`,
+			)
+			.join("") || "";
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow">
+        <h1 style="margin:0">Estimate</h1>
+        <p class="muted" style="margin:0.35rem 0 0">
+          <a href="/jobs/${escapeHtml(id)}">${escapeHtml(job.title)}</a>
+          · ${escapeHtml(job.customer_name)}
+          · Internal (not Xactimate)
+        </p>
+      </div>
+      <a class="btn secondary" href="/jobs/${escapeHtml(id)}/estimate.pdf">Download PDF</a>
+      <a class="btn secondary" href="/jobs/${escapeHtml(id)}">Back to job</a>
+    </div>
+
+    <div class="panel stack" style="margin:1rem 0">
+      <div class="row">
+        <div><span class="muted">Claim #</span><br>${escapeHtml(job.claim_number) || "—"}</div>
+        <div><span class="muted">Carrier</span><br>${escapeHtml(job.carrier) || "—"}</div>
+        <div><span class="muted">Date of loss</span><br>${escapeHtml(job.date_of_loss) || "—"}</div>
+        <div><span class="muted">Estimate total</span><br><strong>${escapeHtml(money(job.estimate_cents))}</strong></div>
+      </div>
+      <p class="muted" style="margin:0">Edit claim fields on the job page. Line totals sync to the job estimate.</p>
+    </div>
+
+    <h2>Rooms / areas</h2>
+    <table>
+      <thead><tr><th>Name</th><th>L × W × H (ft)</th><th>Notes</th><th></th></tr></thead>
+      <tbody>${roomRows}</tbody>
+    </table>
+    <form method="post" action="/jobs/${escapeHtml(id)}/estimate/rooms" class="panel stack" style="margin-top:0.75rem">
+      <div class="row">
+        <div><label for="name">Room name</label><input id="name" name="name" required placeholder="Kitchen" /></div>
+        <div><label for="length_ft">Length (ft)</label><input id="length_ft" name="length_ft" type="number" step="0.01" min="0" /></div>
+        <div><label for="width_ft">Width (ft)</label><input id="width_ft" name="width_ft" type="number" step="0.01" min="0" /></div>
+        <div><label for="height_ft">Height (ft)</label><input id="height_ft" name="height_ft" type="number" step="0.01" min="0" /></div>
+      </div>
+      <div><label for="notes">Notes</label><input id="notes" name="notes" /></div>
+      <button class="btn" type="submit">Add room</button>
+    </form>
+
+    <h2>Line items</h2>
+    <table>
+      <thead><tr><th>Room</th><th>Description</th><th>Qty</th><th>Unit $</th><th>Total</th><th></th></tr></thead>
+      <tbody>${lineRows}</tbody>
+    </table>
+    <form method="post" action="/jobs/${escapeHtml(id)}/estimate/lines" class="panel stack" style="margin-top:0.75rem">
+      <div class="row">
+        <div>
+          <label for="room_id">Room</label>
+          <select id="room_id" name="room_id">
+            <option value="">None</option>
+            ${roomOptions}
+          </select>
+        </div>
+        <div><label for="description">Description</label><input id="description" name="description" required placeholder="Water extraction" /></div>
+      </div>
+      <div class="row">
+        <div><label for="quantity">Quantity</label><input id="quantity" name="quantity" type="number" step="0.01" min="0" value="1" required /></div>
+        <div><label for="unit">Unit</label><input id="unit" name="unit" value="ea" required /></div>
+        <div><label for="unit_dollars">Unit price ($)</label><input id="unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" value="0" required /></div>
+      </div>
+      <button class="btn" type="submit">Add line</button>
+    </form>`;
+
+	return c.html(page(c, `Estimate · ${job.title}`, body));
+});
+
+app.post("/jobs/:id/estimate/rooms", async (c) => {
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const num = (key: string) => {
+		const raw = String(form[key] || "").trim();
+		if (!raw) return null;
+		const n = parseFloat(raw);
+		return Number.isFinite(n) ? n : null;
+	};
+	const count = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS c FROM estimate_rooms WHERE job_id = ?`,
+	)
+		.bind(id)
+		.first<{ c: number }>();
+	await c.env.DB.prepare(
+		`INSERT INTO estimate_rooms (id, job_id, name, length_ft, width_ft, height_ft, notes, sort_order)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			newId("erm"),
+			id,
+			String(form.name || "").trim(),
+			num("length_ft"),
+			num("width_ft"),
+			num("height_ft"),
+			String(form.notes || "").trim() || null,
+			count?.c ?? 0,
+		)
+		.run();
+	return c.redirect(`/jobs/${id}/estimate`);
+});
+
+app.post("/jobs/:id/estimate/rooms/:roomId/delete", async (c) => {
+	const id = c.req.param("id");
+	const roomId = c.req.param("roomId");
+	await c.env.DB.prepare(
+		`UPDATE estimate_lines SET room_id = NULL WHERE room_id = ? AND job_id = ?`,
+	)
+		.bind(roomId, id)
+		.run();
+	await c.env.DB.prepare(
+		`DELETE FROM estimate_rooms WHERE id = ? AND job_id = ?`,
+	)
+		.bind(roomId, id)
+		.run();
+	return c.redirect(`/jobs/${id}/estimate`);
+});
+
+app.post("/jobs/:id/estimate/lines", async (c) => {
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const quantity = parseFloat(String(form.quantity || "1"));
+	const unitDollars = parseFloat(String(form.unit_dollars || "0"));
+	const count = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS c FROM estimate_lines WHERE job_id = ?`,
+	)
+		.bind(id)
+		.first<{ c: number }>();
+	await c.env.DB.prepare(
+		`INSERT INTO estimate_lines (id, job_id, room_id, description, quantity, unit, unit_cents, sort_order)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			newId("eln"),
+			id,
+			String(form.room_id || "").trim() || null,
+			String(form.description || "").trim(),
+			Number.isFinite(quantity) ? quantity : 1,
+			String(form.unit || "ea").trim() || "ea",
+			Number.isFinite(unitDollars) ? Math.round(unitDollars * 100) : 0,
+			count?.c ?? 0,
+		)
+		.run();
+	await syncJobEstimateTotal(c.env.DB, id);
+	return c.redirect(`/jobs/${id}/estimate`);
+});
+
+app.post("/jobs/:id/estimate/lines/:lineId/delete", async (c) => {
+	const id = c.req.param("id");
+	const lineId = c.req.param("lineId");
+	await c.env.DB.prepare(
+		`DELETE FROM estimate_lines WHERE id = ? AND job_id = ?`,
+	)
+		.bind(lineId, id)
+		.run();
+	await syncJobEstimateTotal(c.env.DB, id);
+	return c.redirect(`/jobs/${id}/estimate`);
+});
+
+app.get("/jobs/:id/estimate.pdf", async (c) => {
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT j.*, c.name AS customer_name,
+      s.address_line1, s.city, s.state, s.postal_code
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN sites s ON s.id = j.site_id
+     WHERE j.id = ?`,
+	)
+		.bind(id)
+		.first<{
+			title: string;
+			customer_name: string;
+			claim_number: string | null;
+			carrier: string | null;
+			date_of_loss: string | null;
+			estimate_cents: number | null;
+			address_line1: string | null;
+			city: string | null;
+			state: string | null;
+			postal_code: string | null;
+		}>();
+	if (!job) return c.notFound();
+
+	const rooms = await c.env.DB.prepare(
+		`SELECT name, length_ft, width_ft, height_ft FROM estimate_rooms
+     WHERE job_id = ? ORDER BY sort_order, name`,
+	)
+		.bind(id)
+		.all<{
+			name: string;
+			length_ft: number | null;
+			width_ft: number | null;
+			height_ft: number | null;
+		}>();
+
+	const lines = await c.env.DB.prepare(
+		`SELECT l.description, l.quantity, l.unit, l.unit_cents, r.name AS room_name
+     FROM estimate_lines l
+     LEFT JOIN estimate_rooms r ON r.id = l.room_id
+     WHERE l.job_id = ?
+     ORDER BY l.sort_order, l.description`,
+	)
+		.bind(id)
+		.all<{
+			description: string;
+			quantity: number;
+			unit: string;
+			unit_cents: number;
+			room_name: string | null;
+		}>();
+
+	const total =
+		job.estimate_cents ??
+		Math.round(
+			(lines.results || []).reduce(
+				(sum, l) => sum + l.quantity * l.unit_cents,
+				0,
+			),
+		);
+
+	const siteLine = job.address_line1
+		? `${job.address_line1}, ${job.city}, ${job.state} ${job.postal_code || ""}`.trim()
+		: "";
+
+	const bytes = await buildEstimatePdf({
+		jobTitle: job.title,
+		customerName: job.customer_name,
+		siteLine,
+		claimNumber: job.claim_number,
+		carrier: job.carrier,
+		dateOfLoss: job.date_of_loss,
+		rooms: rooms.results || [],
+		lines: (lines.results || []).map((l) => ({
+			roomName: l.room_name,
+			description: l.description,
+			quantity: l.quantity,
+			unit: l.unit,
+			unit_cents: l.unit_cents,
+		})),
+		totalCents: total,
+	});
+
+	return new Response(bytes, {
+		headers: {
+			"Content-Type": "application/pdf",
+			"Content-Disposition": `attachment; filename="estimate-${id}.pdf"`,
+		},
+	});
 });
 
 app.post("/jobs/:id/checklist/:itemId", async (c) => {
