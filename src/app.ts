@@ -19,7 +19,7 @@ import {
 	statusLabel,
 } from "./lib/html";
 import { newId } from "./lib/ids";
-import { verifyPassword } from "./lib/password";
+import { hashPassword, verifyPassword } from "./lib/password";
 
 export type Env = {
 	DB: D1Database;
@@ -69,6 +69,10 @@ app.use("*", async (c, next) => {
 		return c.redirect("/login");
 	}
 	c.set("user", user);
+	const onPasswordPage = path === "/account/password";
+	if (user.mustChangePassword && !onPasswordPage) {
+		return c.redirect("/account/password");
+	}
 	return next();
 });
 
@@ -76,7 +80,9 @@ app.get("/health", (c) => c.json({ ok: true, app: "lumanyi" }));
 
 app.get("/login", async (c) => {
 	const user = await getSessionUser(c.env.DB, getCookie(c, SESSION_COOKIE));
-	if (user) return c.redirect("/");
+	if (user) {
+		return c.redirect(user.mustChangePassword ? "/account/password" : "/");
+	}
 	const body = `
     <div class="login-wrap">
       <div class="panel stack">
@@ -106,7 +112,7 @@ app.post("/login", async (c) => {
 		.toLowerCase();
 	const password = String(form.password || "");
 	const row = await c.env.DB.prepare(
-		`SELECT id, email, name, role, password_hash FROM users WHERE email = ?`,
+		`SELECT id, email, name, role, password_hash, must_change_password FROM users WHERE email = ?`,
 	)
 		.bind(email)
 		.first<{
@@ -115,6 +121,7 @@ app.post("/login", async (c) => {
 			name: string;
 			role: AppUser["role"];
 			password_hash: string;
+			must_change_password: number;
 		}>();
 
 	if (!row || !(await verifyPassword(password, row.password_hash))) {
@@ -141,6 +148,9 @@ app.post("/login", async (c) => {
 
 	const sessionId = await createSession(c.env.DB, row.id);
 	setSessionCookie(c, sessionId);
+	if (row.must_change_password === 1) {
+		return c.redirect("/account/password");
+	}
 	return c.redirect("/");
 });
 
@@ -148,6 +158,198 @@ app.post("/logout", async (c) => {
 	await destroySession(c.env.DB, getCookie(c, SESSION_COOKIE));
 	clearSessionCookie(c);
 	return c.redirect("/login");
+});
+
+app.get("/account/password", (c) => {
+	const user = c.get("user");
+	const forced = user.mustChangePassword;
+	const body = `
+    <div class="login-wrap">
+      <div class="panel stack">
+        <h1>${forced ? "Change default password" : "Change password"}</h1>
+        ${forced ? `<p class="muted">You must set a new password before using Lumanyi.</p>` : ""}
+        <form method="post" action="/account/password" class="stack">
+          ${forced ? "" : `<div>
+            <label for="current_password">Current password</label>
+            <input id="current_password" name="current_password" type="password" required />
+          </div>`}
+          <div>
+            <label for="new_password">New password</label>
+            <input id="new_password" name="new_password" type="password" required minlength="8" />
+          </div>
+          <div>
+            <label for="confirm_password">Confirm new password</label>
+            <input id="confirm_password" name="confirm_password" type="password" required minlength="8" />
+          </div>
+          <button class="btn" type="submit">Save password</button>
+        </form>
+      </div>
+    </div>`;
+	return c.html(page(c, "Change password", body));
+});
+
+app.post("/account/password", async (c) => {
+	const user = c.get("user");
+	const form = await c.req.parseBody();
+	const newPassword = String(form.new_password || "");
+	const confirm = String(form.confirm_password || "");
+	const forced = user.mustChangePassword;
+
+	const renderError = (message: string) => {
+		const body = `
+    <div class="login-wrap">
+      <div class="panel stack">
+        <h1>${forced ? "Change default password" : "Change password"}</h1>
+        <div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">${escapeHtml(message)}</div>
+        <form method="post" action="/account/password" class="stack">
+          ${forced ? "" : `<div>
+            <label for="current_password">Current password</label>
+            <input id="current_password" name="current_password" type="password" required />
+          </div>`}
+          <div>
+            <label for="new_password">New password</label>
+            <input id="new_password" name="new_password" type="password" required minlength="8" />
+          </div>
+          <div>
+            <label for="confirm_password">Confirm new password</label>
+            <input id="confirm_password" name="confirm_password" type="password" required minlength="8" />
+          </div>
+          <button class="btn" type="submit">Save password</button>
+        </form>
+      </div>
+    </div>`;
+		return c.html(page(c, "Change password", body), 400);
+	};
+
+	if (newPassword.length < 8) {
+		return renderError("Password must be at least 8 characters.");
+	}
+	if (newPassword !== confirm) {
+		return renderError("New passwords do not match.");
+	}
+	if (newPassword === "changeme") {
+		return renderError("Choose a password other than the default.");
+	}
+
+	const row = await c.env.DB.prepare(
+		`SELECT password_hash, must_change_password FROM users WHERE id = ?`,
+	)
+		.bind(user.id)
+		.first<{ password_hash: string; must_change_password: number }>();
+	if (!row) return c.redirect("/login");
+
+	if (row.must_change_password !== 1) {
+		const current = String(form.current_password || "");
+		if (!(await verifyPassword(current, row.password_hash))) {
+			return renderError("Current password is incorrect.");
+		}
+	}
+
+	const passwordHash = await hashPassword(newPassword);
+	await c.env.DB.prepare(
+		`UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?`,
+	)
+		.bind(passwordHash, user.id)
+		.run();
+	return c.redirect("/");
+});
+
+app.get("/users", async (c) => {
+	if (c.get("user").role !== "owner") {
+		return c.html(
+			page(c, "Users", `<h1>Users</h1><p class="muted">Owner access only.</p>`),
+			403,
+		);
+	}
+	const list = await c.env.DB.prepare(
+		`SELECT id, name, email, role, must_change_password, created_at
+     FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{
+		id: string;
+		name: string;
+		email: string;
+		role: string;
+		must_change_password: number;
+		created_at: string;
+	}>();
+
+	const rows =
+		list.results
+			?.map(
+				(u) => `<tr>
+        <td>${escapeHtml(u.name)}</td>
+        <td>${escapeHtml(u.email)}</td>
+        <td>${escapeHtml(u.role)}</td>
+        <td>${u.must_change_password ? "Must change" : "OK"}</td>
+      </tr>`,
+			)
+			.join("") || "";
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow"><h1 style="margin:0">Users</h1></div>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Password</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <h2>Add user</h2>
+    <form method="post" action="/users" class="panel stack">
+      <div class="row">
+        <div><label for="name">Name</label><input id="name" name="name" required /></div>
+        <div><label for="email">Email</label><input id="email" name="email" type="email" required /></div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="role">Role</label>
+          <select id="role" name="role" required>
+            <option value="tech">Tech</option>
+            <option value="dispatcher">Dispatcher</option>
+            <option value="owner">Owner</option>
+          </select>
+        </div>
+        <div>
+          <label for="temp_password">Temporary password</label>
+          <input id="temp_password" name="temp_password" type="text" required minlength="8" value="changeme1" />
+        </div>
+      </div>
+      <p class="muted">New users must change password on first login.</p>
+      <button class="btn" type="submit">Create user</button>
+    </form>`;
+
+	return c.html(page(c, "Users", body));
+});
+
+app.post("/users", async (c) => {
+	if (c.get("user").role !== "owner") return c.text("Forbidden", 403);
+	const form = await c.req.parseBody();
+	const name = String(form.name || "").trim();
+	const email = String(form.email || "")
+		.trim()
+		.toLowerCase();
+	const role = String(form.role || "") as AppUser["role"];
+	const tempPassword = String(form.temp_password || "");
+	if (!name || !email || tempPassword.length < 8) {
+		return c.text("Name, email, and password (8+ chars) required", 400);
+	}
+	if (!["owner", "dispatcher", "tech"].includes(role)) {
+		return c.text("Invalid role", 400);
+	}
+	const existing = await c.env.DB.prepare(
+		`SELECT id FROM users WHERE email = ?`,
+	)
+		.bind(email)
+		.first();
+	if (existing) return c.text("Email already exists", 400);
+
+	const passwordHash = await hashPassword(tempPassword);
+	await c.env.DB.prepare(
+		`INSERT INTO users (id, email, name, password_hash, role, must_change_password)
+     VALUES (?, ?, ?, ?, ?, 1)`,
+	)
+		.bind(newId("usr"), email, name, passwordHash, role)
+		.run();
+	return c.redirect("/users");
 });
 
 app.get("/", async (c) => {
@@ -475,12 +677,23 @@ app.get("/jobs/new", async (c) => {
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
+	const staff = await c.env.DB.prepare(
+		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string; role: string }>();
 
 	const options =
 		customers.results
 			?.map(
 				(cu) =>
 					`<option value="${escapeHtml(cu.id)}" ${cu.id === preselect ? "selected" : ""}>${escapeHtml(cu.name)}</option>`,
+			)
+			.join("") || "";
+
+	const staffOptions =
+		staff.results
+			?.map(
+				(u) =>
+					`<option value="${escapeHtml(u.id)}" ${u.id === c.get("user").id ? "selected" : ""}>${escapeHtml(u.name)} (${escapeHtml(u.role)})</option>`,
 			)
 			.join("") || "";
 
@@ -511,6 +724,13 @@ app.get("/jobs/new", async (c) => {
             <option value="scheduled">Scheduled</option>
           </select>
         </div>
+      </div>
+      <div>
+        <label for="assigned_user_id">Assigned to</label>
+        <select id="assigned_user_id" name="assigned_user_id">
+          <option value="">Unassigned</option>
+          ${staffOptions}
+        </select>
       </div>
       <div class="row">
         <div><label for="scheduled_start">Start</label><input id="scheduled_start" name="scheduled_start" type="datetime-local" /></div>
@@ -561,7 +781,7 @@ app.post("/jobs", async (c) => {
 			String(form.scheduled_end || "").trim() || null,
 			estimateCents,
 			String(form.notes || "").trim() || null,
-			c.get("user").id,
+			String(form.assigned_user_id || "").trim() || null,
 		),
 	];
 
@@ -581,10 +801,12 @@ app.get("/jobs/:id", async (c) => {
 	const id = c.req.param("id");
 	const job = await c.env.DB.prepare(
 		`SELECT j.*, c.name AS customer_name,
-      s.address_line1, s.city, s.state, s.postal_code
+      s.address_line1, s.city, s.state, s.postal_code,
+      a.name AS assignee_name
      FROM jobs j
      JOIN customers c ON c.id = j.customer_id
      LEFT JOIN sites s ON s.id = j.site_id
+     LEFT JOIN users a ON a.id = j.assigned_user_id
      WHERE j.id = ?`,
 	)
 		.bind(id)
@@ -600,12 +822,18 @@ app.get("/jobs/:id", async (c) => {
 			notes: string | null;
 			customer_id: string;
 			customer_name: string;
+			assigned_user_id: string | null;
+			assignee_name: string | null;
 			address_line1: string | null;
 			city: string | null;
 			state: string | null;
 			postal_code: string | null;
 		}>();
 	if (!job) return c.notFound();
+
+	const staff = await c.env.DB.prepare(
+		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string; role: string }>();
 
 	const checklist = await c.env.DB.prepare(
 		`SELECT id, label, done FROM job_checklist_items WHERE job_id = ? ORDER BY sort_order`,
@@ -659,6 +887,14 @@ app.get("/jobs/:id", async (c) => {
 		)
 		.join("");
 
+	const staffOptions =
+		staff.results
+			?.map(
+				(u) =>
+					`<option value="${escapeHtml(u.id)}" ${job.assigned_user_id === u.id ? "selected" : ""}>${escapeHtml(u.name)} (${escapeHtml(u.role)})</option>`,
+			)
+			.join("") || "";
+
 	const body = `
     <div class="toolbar">
       <div class="grow">
@@ -676,6 +912,7 @@ app.get("/jobs/:id", async (c) => {
         <div><span class="muted">Site</span><br>
           ${job.address_line1 ? `${escapeHtml(job.address_line1)}, ${escapeHtml(job.city)}, ${escapeHtml(job.state)} ${escapeHtml(job.postal_code)}` : "—"}
         </div>
+        <div><span class="muted">Assigned</span><br>${escapeHtml(job.assignee_name) || "Unassigned"}</div>
         <div><span class="muted">Schedule</span><br>
           ${escapeHtml(job.scheduled_start ? job.scheduled_start.slice(0, 16).replace("T", " ") : "Not scheduled")}
           ${job.scheduled_end ? ` → ${escapeHtml(job.scheduled_end.slice(0, 16).replace("T", " "))}` : ""}
@@ -691,6 +928,13 @@ app.get("/jobs/:id", async (c) => {
           <div>
             <label for="status">Status</label>
             <select id="status" name="status">${statusOptions}</select>
+          </div>
+          <div>
+            <label for="assigned_user_id">Assigned to</label>
+            <select id="assigned_user_id" name="assigned_user_id">
+              <option value="">Unassigned</option>
+              ${staffOptions}
+            </select>
           </div>
           <div class="row">
             <div><label for="scheduled_start">Start</label>
@@ -734,6 +978,7 @@ app.post("/jobs/:id", async (c) => {
 	await c.env.DB.prepare(
 		`UPDATE jobs SET
       status = ?,
+      assigned_user_id = ?,
       scheduled_start = ?,
       scheduled_end = ?,
       estimate_cents = ?,
@@ -743,6 +988,7 @@ app.post("/jobs/:id", async (c) => {
 	)
 		.bind(
 			String(form.status || "lead"),
+			String(form.assigned_user_id || "").trim() || null,
 			String(form.scheduled_start || "").trim() || null,
 			String(form.scheduled_end || "").trim() || null,
 			estimateRaw ? Math.round(parseFloat(estimateRaw) * 100) : null,
@@ -782,6 +1028,60 @@ app.post("/jobs/:id/notes", async (c) => {
 		.bind(newId("note"), id, c.get("user").id, body)
 		.run();
 	return c.redirect(`/jobs/${id}`);
+});
+
+app.get("/tech", async (c) => {
+	const user = c.get("user");
+	const jobs = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name,
+      s.address_line1, s.city
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN sites s ON s.id = j.site_id
+     WHERE j.assigned_user_id = ?
+       AND j.status IN ('scheduled', 'in_progress', 'estimate')
+     ORDER BY COALESCE(j.scheduled_start, '9999') ASC
+     LIMIT 40`,
+	)
+		.bind(user.id)
+		.all<{
+			id: string;
+			title: string;
+			job_type: string;
+			status: string;
+			scheduled_start: string | null;
+			customer_name: string;
+			address_line1: string | null;
+			city: string | null;
+		}>();
+
+	const cards =
+		jobs.results
+			?.map((j) => {
+				const when = j.scheduled_start
+					? j.scheduled_start.slice(0, 16).replace("T", " ")
+					: "Unscheduled";
+				const where = j.address_line1
+					? `${j.address_line1}${j.city ? `, ${j.city}` : ""}`
+					: "No address";
+				return `<a class="panel stack" href="/jobs/${escapeHtml(j.id)}" style="color:inherit;text-decoration:none">
+        <div style="display:flex;justify-content:space-between;gap:0.5rem;align-items:start">
+          <strong>${escapeHtml(j.title)}</strong>
+          <span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span>
+        </div>
+        <div class="muted">${escapeHtml(j.customer_name)} · ${escapeHtml(jobTypeLabel(j.job_type))}</div>
+        <div>${escapeHtml(when)}</div>
+        <div class="muted">${escapeHtml(where)}</div>
+      </a>`;
+			})
+			.join("") || `<p class="muted">No jobs assigned to you.</p>`;
+
+	const body = `
+    <h1>My jobs</h1>
+    <p class="muted">Assigned to ${escapeHtml(user.name)} — tap a card to update checklist and notes.</p>
+    <div class="stack" style="margin-top:1rem">${cards}</div>`;
+
+	return c.html(page(c, "Tech", body));
 });
 
 app.get("/calendar", async (c) => {
@@ -839,6 +1139,28 @@ app.get("/calendar", async (c) => {
     ${sections}`;
 
 	return c.html(page(c, "Calendar", body));
+});
+
+app.onError((err, c) => {
+	const requestId = crypto.randomUUID().slice(0, 8);
+	console.error(`[${requestId}]`, err);
+	const user = (() => {
+		try {
+			return c.get("user");
+		} catch {
+			return null;
+		}
+	})();
+	return c.html(
+		layout({
+			title: "Error",
+			user,
+			body: `<h1>Something went wrong</h1>
+        <p class="muted">Request id: <code>${escapeHtml(requestId)}</code></p>
+        <p><a class="btn" href="/">Back to dashboard</a></p>`,
+		}),
+		500,
+	);
 });
 
 /** Fall through to static assets (CSS, etc.). */

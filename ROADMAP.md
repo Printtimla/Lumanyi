@@ -1,8 +1,9 @@
-# Lumanyi ROADMAP (agent-readable)
+# Lumanyi ROADMAP (manual build)
 
-Agents: work top-to-bottom. Check off items with `[x]` only after `npm run ci` passes.
+Work top-to-bottom in this chat. Check off items with `[x]` only after `npm run ci` passes.
 Do not start Print Ops or Xactimate-depth estimating until Field Ops Release 1 is complete.
-Prefer small PRs. Do not invent pricing, insurance claims, or carrier rules.
+**Manual only** — no Cursor Automations / cloud agents unless the owner re-enables them.
+Skip items marked **external** until the owner asks to connect Cloudflare/GitHub again.
 
 ## Release 1 — Field Ops MVP (current)
 
@@ -13,23 +14,23 @@ Prefer small PRs. Do not invent pricing, insurance claims, or carrier rules.
 - [x] Job checklists + field notes
 - [x] Simple estimate / invoice dollar fields
 - [x] Calendar list by day
-- [ ] Change default password flow / force password change on first login
-- [ ] Assign job to a tech user (user picker)
-- [ ] Create additional users (owner-only)
-- [ ] Photo uploads to R2 on job notes
+- [x] Change default password flow / force password change on first login
+- [x] Assign job to a tech user (user picker)
+- [x] Create additional users (owner-only)
+- [ ] Photo uploads to R2 on job notes — **external (Cloudflare R2)** — deferred
 - [x] Soften secure-cookie for local HTTP without breaking production
 - [x] Basic Vitest coverage for health + login redirect
-- [ ] Replace placeholder D1 `database_id` after `wrangler d1 create`
+- [ ] Replace placeholder D1 `database_id` after `wrangler d1 create` — **external** — deferred
 - [x] GitHub Actions CI workflow file added
-- [ ] Staging deploy on Cloudflare
+- [ ] Staging deploy on Cloudflare — **external** — deferred
+- [x] Mobile-first tech job view (`/tech`)
+- [x] Error page + request id logging
 
 ## Release 1.1 — Daily ops polish
 
 - [ ] Recurring hard-floor jobs
 - [ ] Job filters by tech / date range
 - [ ] CSV export of jobs
-- [ ] Mobile-first tech job view (`/tech`)
-- [ ] Error page + request id logging
 
 ## Later — Estimating track
 
@@ -46,5 +47,5 @@ Prefer small PRs. Do not invent pricing, insurance claims, or carrier rules.
 ## Bug triage rules (always)
 
 1. P0 (cannot sign in / schedule / save job): fix same session before new features
-2. P1: fix within next automation run
+2. P1: fix before the next feature
 3. P2: append to Release 1.1

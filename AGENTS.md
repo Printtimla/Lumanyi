@@ -1,8 +1,14 @@
 # Lumanyi — agent notes
 
-STOP. Prefer current Cloudflare docs over memorized APIs:
+STOP. Prefer current Cloudflare docs over memorized APIs when (and only when) the owner asks for Cloudflare work:
 https://developers.cloudflare.com/workers/
 https://developers.cloudflare.com/d1/
+
+## Mode
+
+- **Manual build in chat** unless the owner re-enables Automations.
+- Do **not** push, deploy, create cloud resources, or open external editors unless asked.
+- Local: `npm run ci`, `npm run db:migrate:local`, `npm run dev`.
 
 ## Product boundary
 
@@ -12,9 +18,9 @@ https://developers.cloudflare.com/d1/
 
 ## Work style
 
-1. Read `ROADMAP.md` — take the next unchecked Release 1 item.
+1. Read `ROADMAP.md` — take the next unchecked **non-external** Release 1 item.
 2. Implement the smallest useful change.
-3. Run `npm run ci` (typecheck + tests).
+3. Run `npm run ci`.
 4. Update ROADMAP checkboxes when done.
 5. Prefer fixing P0/P1 bugs before new features.
 
@@ -25,12 +31,10 @@ https://developers.cloudflare.com/d1/
 | `npm run dev` | Local Worker (http://localhost:8787) |
 | `npm run db:migrate:local` | Apply D1 migrations locally |
 | `npm run ci` | Typecheck + Vitest |
-| `npm run deploy` | Deploy (requires real D1 database_id) |
-| `npx wrangler types` | Regenerate `worker-configuration.d.ts` after binding changes |
 
 ## Auth seed
 
-Default user created on empty DB: `owner@lumanyi.local` / `changeme`
+Default user on empty DB: `owner@lumanyi.local` / `changeme` (forced password change on login).
 
 ## Schema
 

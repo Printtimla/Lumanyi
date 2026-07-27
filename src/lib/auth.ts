@@ -8,6 +8,7 @@ export type AppUser = {
 	email: string;
 	name: string;
 	role: "owner" | "dispatcher" | "tech";
+	mustChangePassword: boolean;
 };
 
 const SESSION_COOKIE = "lumanyi_session";
@@ -23,8 +24,8 @@ export async function ensureSeedUser(db: D1Database): Promise<void> {
 	const passwordHash = await hashPassword("changeme");
 	await db
 		.prepare(
-			`INSERT INTO users (id, email, name, password_hash, role)
-       VALUES (?, ?, ?, ?, ?)`,
+			`INSERT INTO users (id, email, name, password_hash, role, must_change_password)
+       VALUES (?, ?, ?, ?, ?, 1)`,
 		)
 		.bind(id, "owner@lumanyi.local", "Owner", passwordHash, "owner")
 		.run();
@@ -69,13 +70,20 @@ export async function getSessionUser(
 
 	const row = await db
 		.prepare(
-			`SELECT u.id, u.email, u.name, u.role, s.expires_at
+			`SELECT u.id, u.email, u.name, u.role, u.must_change_password, s.expires_at
      FROM sessions s
      JOIN users u ON u.id = s.user_id
      WHERE s.id = ?`,
 		)
 		.bind(sessionId)
-		.first<AppUser & { expires_at: string }>();
+		.first<{
+			id: string;
+			email: string;
+			name: string;
+			role: AppUser["role"];
+			must_change_password: number;
+			expires_at: string;
+		}>();
 
 	if (!row) return null;
 	if (new Date(row.expires_at) < new Date()) {
@@ -88,6 +96,7 @@ export async function getSessionUser(
 		email: row.email,
 		name: row.name,
 		role: row.role,
+		mustChangePassword: row.must_change_password === 1,
 	};
 }
 

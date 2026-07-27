@@ -14,29 +14,35 @@ export function money(cents: number | null | undefined): string {
 	return `$${(cents / 100).toFixed(2)}`;
 }
 
-const NAV = [
-	{ href: "/", label: "Dashboard" },
-	{ href: "/customers", label: "Customers" },
-	{ href: "/jobs", label: "Jobs" },
-	{ href: "/calendar", label: "Calendar" },
-] as const;
-
 export function layout(opts: {
 	title: string;
 	user?: AppUser | null;
 	body: string;
 	flash?: string | null;
 }): string {
-	const nav = opts.user
-		? NAV.map(
-				(item) =>
-					`<a href="${item.href}">${escapeHtml(item.label)}</a>`,
-			).join("")
-		: "";
+	const items: Array<{ href: string; label: string }> = opts.user
+		? [
+				{ href: "/", label: "Dashboard" },
+				{ href: "/customers", label: "Customers" },
+				{ href: "/jobs", label: "Jobs" },
+				{ href: "/calendar", label: "Calendar" },
+			]
+		: [];
+	if (opts.user?.role === "owner") {
+		items.push({ href: "/users", label: "Users" });
+	}
+	if (opts.user) {
+		items.push({ href: "/tech", label: "Tech" });
+	}
+
+	const nav = items
+		.map((item) => `<a href="${item.href}">${escapeHtml(item.label)}</a>`)
+		.join("");
 
 	const userBar = opts.user
 		? `<div class="userbar">
         <span>${escapeHtml(opts.user.name)} · ${escapeHtml(opts.user.role)}</span>
+        <a href="/account/password">Password</a>
         <form method="post" action="/logout" class="inline">
           <button type="submit" class="linkish">Log out</button>
         </form>

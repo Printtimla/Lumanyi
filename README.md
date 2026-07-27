@@ -40,4 +40,4 @@ Default login: `owner@lumanyi.local` / `changeme`
 
 ## Automation
 
-See `ROADMAP.md`. Scheduled Cursor agents should pick the next unchecked Release 1 / polish item, implement, run `npm run ci`, and open a PR (or commit to `dev`).
+Manual build in chat by default. Cursor Automations / cloud agents are optional and off unless re-enabled.
