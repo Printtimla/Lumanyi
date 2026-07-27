@@ -28,9 +28,9 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 
 ## Release 1.1 — Daily ops polish
 
-- [ ] Recurring hard-floor jobs
-- [ ] Job filters by tech / date range
-- [ ] CSV export of jobs
+- [x] Recurring hard-floor jobs
+- [x] Job filters by tech / date range
+- [x] CSV export of jobs
 
 ## Later — Estimating track
 

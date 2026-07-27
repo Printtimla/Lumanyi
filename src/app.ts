@@ -20,6 +20,7 @@ import {
 } from "./lib/html";
 import { newId } from "./lib/ids";
 import { hashPassword, verifyPassword } from "./lib/password";
+import { generateDueRecurringJobs } from "./lib/recurring";
 
 export type Env = {
 	DB: D1Database;
@@ -606,42 +607,77 @@ app.get("/customers/:id", async (c) => {
 
 app.get("/jobs", async (c) => {
 	const status = c.req.query("status") || "";
-	const jobs = status
-		? await c.env.DB.prepare(
-				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
-         FROM jobs j JOIN customers c ON c.id = j.customer_id
-         WHERE j.status = ?
-         ORDER BY j.updated_at DESC LIMIT 100`,
-			)
-				.bind(status)
-				.all()
-		: await c.env.DB.prepare(
-				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
-         FROM jobs j JOIN customers c ON c.id = j.customer_id
-         ORDER BY j.updated_at DESC LIMIT 100`,
-			).all();
+	const tech = c.req.query("tech") || "";
+	const from = c.req.query("from") || "";
+	const to = c.req.query("to") || "";
+
+	const where: string[] = ["1=1"];
+	const binds: string[] = [];
+	if (status) {
+		where.push("j.status = ?");
+		binds.push(status);
+	}
+	if (tech) {
+		where.push("j.assigned_user_id = ?");
+		binds.push(tech);
+	}
+	if (from) {
+		where.push("date(j.scheduled_start) >= date(?)");
+		binds.push(from);
+	}
+	if (to) {
+		where.push("date(j.scheduled_start) <= date(?)");
+		binds.push(to);
+	}
+
+	const sql = `SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start,
+      c.name AS customer_name, u.name AS assignee_name
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN users u ON u.id = j.assigned_user_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY j.updated_at DESC LIMIT 200`;
+
+	const stmt = c.env.DB.prepare(sql);
+	const jobs = binds.length
+		? await stmt.bind(...binds).all<{
+				id: string;
+				title: string;
+				job_type: string;
+				status: string;
+				scheduled_start: string | null;
+				customer_name: string;
+				assignee_name: string | null;
+			}>()
+		: await stmt.all<{
+				id: string;
+				title: string;
+				job_type: string;
+				status: string;
+				scheduled_start: string | null;
+				customer_name: string;
+				assignee_name: string | null;
+			}>();
+
+	const staff = await c.env.DB.prepare(
+		`SELECT id, name FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string }>();
 
 	const rows =
-		(jobs.results as Array<{
-			id: string;
-			title: string;
-			job_type: string;
-			status: string;
-			scheduled_start: string | null;
-			customer_name: string;
-		}> | undefined)
+		jobs.results
 			?.map(
 				(j) => `<tr>
         <td><a href="/jobs/${escapeHtml(j.id)}">${escapeHtml(j.title)}</a></td>
         <td>${escapeHtml(j.customer_name)}</td>
+        <td>${escapeHtml(j.assignee_name) || "—"}</td>
         <td>${escapeHtml(jobTypeLabel(j.job_type))}</td>
         <td><span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span></td>
         <td>${escapeHtml(j.scheduled_start ? j.scheduled_start.slice(0, 16).replace("T", " ") : "—")}</td>
       </tr>`,
 			)
-			.join("") || `<tr><td colspan="5" class="muted">No jobs yet.</td></tr>`;
+			.join("") || `<tr><td colspan="6" class="muted">No jobs match.</td></tr>`;
 
-	const filters = [
+	const statusFilters = [
 		"",
 		"lead",
 		"estimate",
@@ -651,25 +687,146 @@ app.get("/jobs", async (c) => {
 		"invoiced",
 	]
 		.map((s) => {
-			const label = s || "all";
-			const href = s ? `/jobs?status=${s}` : "/jobs";
+			const q = new URLSearchParams();
+			if (s) q.set("status", s);
+			if (tech) q.set("tech", tech);
+			if (from) q.set("from", from);
+			if (to) q.set("to", to);
+			const qs = q.toString();
+			const href = qs ? `/jobs?${qs}` : "/jobs";
 			const active = status === s ? "btn" : "btn secondary";
-			return `<a class="${active}" href="${href}">${escapeHtml(statusLabel(label))}</a>`;
+			return `<a class="${active}" href="${href}">${escapeHtml(statusLabel(s || "all"))}</a>`;
 		})
 		.join(" ");
+
+	const staffOptions =
+		staff.results
+			?.map(
+				(u) =>
+					`<option value="${escapeHtml(u.id)}" ${tech === u.id ? "selected" : ""}>${escapeHtml(u.name)}</option>`,
+			)
+			.join("") || "";
+
+	const exportQ = new URLSearchParams();
+	if (status) exportQ.set("status", status);
+	if (tech) exportQ.set("tech", tech);
+	if (from) exportQ.set("from", from);
+	if (to) exportQ.set("to", to);
+	const exportHref = `/jobs/export.csv${exportQ.toString() ? `?${exportQ}` : ""}`;
 
 	const body = `
     <div class="toolbar">
       <div class="grow"><h1 style="margin:0">Jobs</h1></div>
+      <a class="btn secondary" href="${escapeHtml(exportHref)}">Export CSV</a>
       <a class="btn" href="/jobs/new">New job</a>
     </div>
-    <div class="toolbar">${filters}</div>
+    <form class="panel toolbar" method="get" action="/jobs" style="align-items:end">
+      ${status ? `<input type="hidden" name="status" value="${escapeHtml(status)}" />` : ""}
+      <div>
+        <label for="tech">Tech</label>
+        <select id="tech" name="tech">
+          <option value="">All</option>
+          ${staffOptions}
+        </select>
+      </div>
+      <div>
+        <label for="from">From</label>
+        <input id="from" name="from" type="date" value="${escapeHtml(from)}" />
+      </div>
+      <div>
+        <label for="to">To</label>
+        <input id="to" name="to" type="date" value="${escapeHtml(to)}" />
+      </div>
+      <button class="btn secondary" type="submit">Apply</button>
+      <a class="btn secondary" href="/jobs">Clear</a>
+    </form>
+    <div class="toolbar">${statusFilters}</div>
     <table>
-      <thead><tr><th>Job</th><th>Customer</th><th>Type</th><th>Status</th><th>When</th></tr></thead>
+      <thead><tr><th>Job</th><th>Customer</th><th>Tech</th><th>Type</th><th>Status</th><th>When</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 
 	return c.html(page(c, "Jobs", body));
+});
+
+app.get("/jobs/export.csv", async (c) => {
+	const status = c.req.query("status") || "";
+	const tech = c.req.query("tech") || "";
+	const from = c.req.query("from") || "";
+	const to = c.req.query("to") || "";
+
+	const where: string[] = ["1=1"];
+	const binds: string[] = [];
+	if (status) {
+		where.push("j.status = ?");
+		binds.push(status);
+	}
+	if (tech) {
+		where.push("j.assigned_user_id = ?");
+		binds.push(tech);
+	}
+	if (from) {
+		where.push("date(j.scheduled_start) >= date(?)");
+		binds.push(from);
+	}
+	if (to) {
+		where.push("date(j.scheduled_start) <= date(?)");
+		binds.push(to);
+	}
+
+	const sql = `SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start,
+      j.estimate_cents, j.invoice_cents, c.name AS customer_name, u.name AS assignee_name
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN users u ON u.id = j.assigned_user_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY j.scheduled_start ASC, j.created_at DESC
+     LIMIT 2000`;
+
+	const stmt = c.env.DB.prepare(sql);
+	const jobs = binds.length ? await stmt.bind(...binds).all() : await stmt.all();
+
+	const escapeCsv = (value: string | number | null | undefined) => {
+		const s = String(value ?? "");
+		if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+		return s;
+	};
+
+	const lines = [
+		[
+			"id",
+			"title",
+			"customer",
+			"tech",
+			"type",
+			"status",
+			"scheduled_start",
+			"estimate_cents",
+			"invoice_cents",
+		].join(","),
+	];
+	for (const j of (jobs.results || []) as Array<Record<string, unknown>>) {
+		lines.push(
+			[
+				escapeCsv(j.id as string),
+				escapeCsv(j.title as string),
+				escapeCsv(j.customer_name as string),
+				escapeCsv(j.assignee_name as string),
+				escapeCsv(j.job_type as string),
+				escapeCsv(j.status as string),
+				escapeCsv(j.scheduled_start as string),
+				escapeCsv(j.estimate_cents as number),
+				escapeCsv(j.invoice_cents as number),
+			].join(","),
+		);
+	}
+
+	return new Response(lines.join("\n") + "\n", {
+		headers: {
+			"Content-Type": "text/csv; charset=utf-8",
+			"Content-Disposition": 'attachment; filename="lumanyi-jobs.csv"',
+		},
+	});
 });
 
 app.get("/jobs/new", async (c) => {
@@ -1028,6 +1185,190 @@ app.post("/jobs/:id/notes", async (c) => {
 		.bind(newId("note"), id, c.get("user").id, body)
 		.run();
 	return c.redirect(`/jobs/${id}`);
+});
+
+app.get("/recurring", async (c) => {
+	const list = await c.env.DB.prepare(
+		`SELECT r.*, c.name AS customer_name, u.name AS assignee_name
+     FROM recurring_jobs r
+     JOIN customers c ON c.id = r.customer_id
+     LEFT JOIN users u ON u.id = r.assigned_user_id
+     ORDER BY r.active DESC, r.next_run_at ASC`,
+	).all<{
+		id: string;
+		title: string;
+		job_type: string;
+		interval_days: number;
+		next_run_at: string;
+		active: number;
+		customer_name: string;
+		assignee_name: string | null;
+	}>();
+
+	const customers = await c.env.DB.prepare(
+		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string }>();
+	const staff = await c.env.DB.prepare(
+		`SELECT id, name FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string }>();
+
+	const rows =
+		list.results
+			?.map(
+				(r) => `<tr>
+        <td>${escapeHtml(r.title)}</td>
+        <td>${escapeHtml(r.customer_name)}</td>
+        <td>${escapeHtml(jobTypeLabel(r.job_type))}</td>
+        <td>Every ${r.interval_days} days</td>
+        <td>${escapeHtml(r.next_run_at.slice(0, 10))}</td>
+        <td>${escapeHtml(r.assignee_name) || "—"}</td>
+        <td>${r.active ? "Active" : "Paused"}</td>
+        <td>
+          <form method="post" action="/recurring/${escapeHtml(r.id)}/toggle" class="inline">
+            <button class="linkish" type="submit">${r.active ? "Pause" : "Resume"}</button>
+          </form>
+        </td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="8" class="muted">No recurring templates yet.</td></tr>`;
+
+	const customerOptions =
+		customers.results
+			?.map(
+				(cu) =>
+					`<option value="${escapeHtml(cu.id)}">${escapeHtml(cu.name)}</option>`,
+			)
+			.join("") || "";
+	const staffOptions =
+		staff.results
+			?.map(
+				(u) =>
+					`<option value="${escapeHtml(u.id)}">${escapeHtml(u.name)}</option>`,
+			)
+			.join("") || "";
+
+	const today = new Date().toISOString().slice(0, 10);
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow"><h1 style="margin:0">Recurring</h1></div>
+      <form method="post" action="/recurring/generate" class="inline">
+        <button class="btn secondary" type="submit">Generate due jobs</button>
+      </form>
+    </div>
+    <p class="muted">Hard-floor (and other) contracts. “Generate due jobs” creates scheduled jobs for templates whose next date is today or earlier.</p>
+    <table>
+      <thead><tr><th>Title</th><th>Customer</th><th>Type</th><th>Cadence</th><th>Next</th><th>Tech</th><th>Status</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <h2>New recurring job</h2>
+    <form method="post" action="/recurring" class="panel stack">
+      <div>
+        <label for="customer_id">Customer</label>
+        <select id="customer_id" name="customer_id" required>
+          <option value="">Select…</option>
+          ${customerOptions}
+        </select>
+      </div>
+      <div><label for="title">Title</label><input id="title" name="title" required placeholder="Monthly hard floor clean" /></div>
+      <div class="row">
+        <div>
+          <label for="job_type">Type</label>
+          <select id="job_type" name="job_type">
+            <option value="hard_floor" selected>Hard floor cleaning</option>
+            <option value="restoration">Water restoration</option>
+          </select>
+        </div>
+        <div>
+          <label for="interval_days">Every N days</label>
+          <input id="interval_days" name="interval_days" type="number" min="1" value="30" required />
+        </div>
+        <div>
+          <label for="next_run_at">Next run date</label>
+          <input id="next_run_at" name="next_run_at" type="date" value="${escapeHtml(today)}" required />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="assigned_user_id">Assigned to</label>
+          <select id="assigned_user_id" name="assigned_user_id">
+            <option value="">Unassigned</option>
+            ${staffOptions}
+          </select>
+        </div>
+        <div>
+          <label for="estimate_dollars">Estimate ($)</label>
+          <input id="estimate_dollars" name="estimate_dollars" type="number" step="0.01" min="0" />
+        </div>
+      </div>
+      <div><label for="notes">Notes</label><textarea id="notes" name="notes"></textarea></div>
+      <button class="btn" type="submit">Save recurring</button>
+    </form>`;
+
+	return c.html(page(c, "Recurring", body));
+});
+
+app.post("/recurring", async (c) => {
+	const form = await c.req.parseBody();
+	const customerId = String(form.customer_id || "");
+	const jobType = String(form.job_type || "hard_floor") as
+		| "restoration"
+		| "hard_floor";
+	if (jobType !== "restoration" && jobType !== "hard_floor") {
+		return c.text("Invalid job type", 400);
+	}
+	const intervalDays = Number(form.interval_days || 0);
+	if (!customerId || !Number.isFinite(intervalDays) || intervalDays < 1) {
+		return c.text("Customer and interval required", 400);
+	}
+	const site = await c.env.DB.prepare(
+		`SELECT id FROM sites WHERE customer_id = ? ORDER BY created_at LIMIT 1`,
+	)
+		.bind(customerId)
+		.first<{ id: string }>();
+	const estimateRaw = String(form.estimate_dollars || "").trim();
+	await c.env.DB.prepare(
+		`INSERT INTO recurring_jobs (
+      id, customer_id, site_id, title, job_type, interval_days, next_run_at,
+      assigned_user_id, estimate_cents, notes, active
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+	)
+		.bind(
+			newId("rec"),
+			customerId,
+			site?.id ?? null,
+			String(form.title || "").trim(),
+			jobType,
+			intervalDays,
+			String(form.next_run_at || "").slice(0, 10),
+			String(form.assigned_user_id || "").trim() || null,
+			estimateRaw ? Math.round(parseFloat(estimateRaw) * 100) : null,
+			String(form.notes || "").trim() || null,
+		)
+		.run();
+	return c.redirect("/recurring");
+});
+
+app.post("/recurring/generate", async (c) => {
+	const created = await generateDueRecurringJobs(c.env.DB);
+	return c.html(
+		page(
+			c,
+			"Recurring",
+			`<h1>Generated</h1><p>Created ${created} job(s) from due templates.</p>
+       <p><a class="btn" href="/recurring">Back</a> <a class="btn secondary" href="/jobs?status=scheduled">View scheduled</a></p>`,
+		),
+	);
+});
+
+app.post("/recurring/:id/toggle", async (c) => {
+	const id = c.req.param("id");
+	await c.env.DB.prepare(
+		`UPDATE recurring_jobs SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect("/recurring");
 });
 
 app.get("/tech", async (c) => {

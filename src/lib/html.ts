@@ -32,6 +32,7 @@ export function layout(opts: {
 		items.push({ href: "/users", label: "Users" });
 	}
 	if (opts.user) {
+		items.push({ href: "/recurring", label: "Recurring" });
 		items.push({ href: "/tech", label: "Tech" });
 	}
 
