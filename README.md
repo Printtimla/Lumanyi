@@ -10,6 +10,24 @@ Print Ops is a later product on the same platform idea — not in Release 1.
 - D1 (SQLite)
 - Cookie sessions (internal only)
 
+## Cloudflare
+
+| Resource | Name / id |
+|----------|-----------|
+| D1 prod | `lumanyi` · `88d1c1e4-255d-4d32-a44c-509f065f997c` |
+| D1 staging | `lumanyi-staging` · `422f351b-819e-447e-88b2-630d06521bf2` |
+| R2 | `lumanyi-uploads` |
+| Worker staging | `lumanyi-staging` · https://lumanyi-staging.timla-uploads.workers.dev |
+| Worker prod | `lumanyi` (`npm run deploy`) — migrate prod DB first |
+
+```bash
+npm run db:migrate:local
+npm run db:migrate:staging   # after code changes that add migrations
+npm run deploy:staging
+npm run db:migrate:prod      # before/with prod deploy
+npm run deploy
+```
+
 ## Local
 
 ```bash

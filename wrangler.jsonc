@@ -1,7 +1,8 @@
 /**
- * Lumanyi — internal Field Ops on Cloudflare Workers.
+ * Lumanyi — Cloudflare Workers config
  * https://developers.cloudflare.com/workers/
  * https://developers.cloudflare.com/d1/
+ * https://developers.cloudflare.com/r2/
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
@@ -21,12 +22,38 @@
 		{
 			"binding": "DB",
 			"database_name": "lumanyi",
-			"database_id": "local-lumanyi-db",
+			"database_id": "88d1c1e4-255d-4d32-a44c-509f065f997c",
 			"migrations_dir": "migrations"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "UPLOADS",
+			"bucket_name": "lumanyi-uploads",
+			"preview_bucket_name": "lumanyi-uploads"
 		}
 	],
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+	"env": {
+		"staging": {
+			"name": "lumanyi-staging",
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "lumanyi-staging",
+					"database_id": "422f351b-819e-447e-88b2-630d06521bf2",
+					"migrations_dir": "migrations"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "UPLOADS",
+					"bucket_name": "lumanyi-uploads"
+				}
+			]
+		}
+	}
 }

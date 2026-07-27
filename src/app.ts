@@ -32,6 +32,7 @@ import {
 export type Env = {
 	DB: D1Database;
 	ASSETS: Fetcher;
+	UPLOADS: R2Bucket;
 };
 
 type Variables = {
@@ -1016,6 +1017,18 @@ app.get("/jobs/:id", async (c) => {
 		.bind(id)
 		.all<{ body: string; created_at: string; user_name: string | null }>();
 
+	const photos = await c.env.DB.prepare(
+		`SELECT id, filename, content_type, created_at FROM job_photos
+     WHERE job_id = ? ORDER BY created_at DESC`,
+	)
+		.bind(id)
+		.all<{
+			id: string;
+			filename: string;
+			content_type: string | null;
+			created_at: string;
+		}>();
+
 	const checkItems =
 		checklist.results
 			?.map(
@@ -1038,6 +1051,23 @@ app.get("/jobs/:id", async (c) => {
       </div>`,
 			)
 			.join("") || `<p class="muted">No notes yet.</p>`;
+
+	const photoItems =
+		photos.results
+			?.map(
+				(p) => `<div class="panel" style="padding:0.75rem">
+        <a href="/jobs/${escapeHtml(id)}/photos/${escapeHtml(p.id)}" target="_blank" rel="noopener">
+          <img src="/jobs/${escapeHtml(id)}/photos/${escapeHtml(p.id)}" alt="${escapeHtml(p.filename)}"
+            style="max-width:100%;max-height:220px;border-radius:8px;display:block;margin-bottom:0.5rem" />
+        </a>
+        <div class="muted" style="font-size:0.8rem">${escapeHtml(p.filename)} · ${escapeHtml(p.created_at.slice(0, 16).replace("T", " "))}</div>
+        <form method="post" action="/jobs/${escapeHtml(id)}/photos/${escapeHtml(p.id)}/delete" class="inline"
+          onsubmit="return confirm('Delete this photo?');">
+          <button class="linkish" type="submit">Delete</button>
+        </form>
+      </div>`,
+			)
+			.join("") || `<p class="muted">No photos yet.</p>`;
 
 	const statusOptions = [
 		"lead",
@@ -1146,7 +1176,17 @@ app.get("/jobs/:id", async (c) => {
       <textarea name="body" required placeholder="Photos taken, moisture readings, customer instructions…"></textarea>
       <button class="btn" type="submit">Add note</button>
     </form>
-    <div class="stack">${noteItems}</div>`;
+    <div class="stack">${noteItems}</div>
+
+    <h2>Photos</h2>
+    <form method="post" action="/jobs/${escapeHtml(id)}/photos" enctype="multipart/form-data" class="panel stack" style="margin-bottom:1rem">
+      <div>
+        <label for="photo">Upload image (max 10 MB)</label>
+        <input id="photo" name="photo" type="file" accept="image/*" required />
+      </div>
+      <button class="btn" type="submit">Upload photo</button>
+    </form>
+    <div class="stack">${photoItems}</div>`;
 
 	return c.html(page(c, job.title, body));
 });
@@ -1558,6 +1598,99 @@ app.post("/jobs/:id/notes", async (c) => {
 		`INSERT INTO job_notes (id, job_id, user_id, body) VALUES (?, ?, ?, ?)`,
 	)
 		.bind(newId("note"), id, c.get("user").id, body)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
+
+app.post("/jobs/:id/photos", async (c) => {
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(`SELECT id FROM jobs WHERE id = ?`)
+		.bind(id)
+		.first();
+	if (!job) return c.notFound();
+
+	const form = await c.req.parseBody();
+	const file = form.photo;
+	if (!file || !(file instanceof File)) {
+		return c.text("Photo file required", 400);
+	}
+	if (!file.type.startsWith("image/")) {
+		return c.text("Only image uploads are allowed", 400);
+	}
+	if (file.size > MAX_PHOTO_BYTES) {
+		return c.text("Image must be 10 MB or smaller", 400);
+	}
+
+	const photoId = newId("pho");
+	const safeName = file.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "photo.jpg";
+	const r2Key = `jobs/${id}/${photoId}/${safeName}`;
+	const bytes = new Uint8Array(await file.arrayBuffer());
+	await c.env.UPLOADS.put(r2Key, bytes, {
+		httpMetadata: { contentType: file.type },
+		customMetadata: { jobId: id, photoId, filename: safeName },
+	});
+	await c.env.DB.prepare(
+		`INSERT INTO job_photos (id, job_id, r2_key, filename, content_type, size_bytes, uploaded_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			photoId,
+			id,
+			r2Key,
+			safeName,
+			file.type || null,
+			file.size,
+			c.get("user").id,
+		)
+		.run();
+	await c.env.DB.prepare(
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.get("/jobs/:id/photos/:photoId", async (c) => {
+	const id = c.req.param("id");
+	const photoId = c.req.param("photoId");
+	const row = await c.env.DB.prepare(
+		`SELECT r2_key, content_type, filename FROM job_photos WHERE id = ? AND job_id = ?`,
+	)
+		.bind(photoId, id)
+		.first<{ r2_key: string; content_type: string | null; filename: string }>();
+	if (!row) return c.notFound();
+	const obj = await c.env.UPLOADS.get(row.r2_key);
+	if (!obj) return c.notFound();
+	const headers = new Headers();
+	headers.set(
+		"Content-Type",
+		row.content_type || obj.httpMetadata?.contentType || "application/octet-stream",
+	);
+	headers.set("Cache-Control", "private, max-age=3600");
+	headers.set(
+		"Content-Disposition",
+		`inline; filename="${row.filename.replace(/"/g, "")}"`,
+	);
+	return new Response(obj.body, { headers });
+});
+
+app.post("/jobs/:id/photos/:photoId/delete", async (c) => {
+	const id = c.req.param("id");
+	const photoId = c.req.param("photoId");
+	const row = await c.env.DB.prepare(
+		`SELECT r2_key FROM job_photos WHERE id = ? AND job_id = ?`,
+	)
+		.bind(photoId, id)
+		.first<{ r2_key: string }>();
+	if (!row) return c.notFound();
+	await c.env.UPLOADS.delete(row.r2_key);
+	await c.env.DB.prepare(
+		`DELETE FROM job_photos WHERE id = ? AND job_id = ?`,
+	)
+		.bind(photoId, id)
 		.run();
 	return c.redirect(`/jobs/${id}`);
 });

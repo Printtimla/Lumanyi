@@ -4,13 +4,16 @@
   "private": true,
   "scripts": {
     "deploy": "wrangler deploy",
+    "deploy:staging": "wrangler deploy --env staging",
     "dev": "wrangler dev",
     "start": "wrangler dev",
     "test": "vitest",
     "cf-typegen": "wrangler types",
     "typecheck": "tsc --noEmit",
     "ci": "npm run typecheck && npm test",
-    "db:migrate:local": "wrangler d1 migrations apply lumanyi --local"
+    "db:migrate:local": "wrangler d1 migrations apply lumanyi --local",
+    "db:migrate:staging": "wrangler d1 migrations apply lumanyi-staging --remote --env staging",
+    "db:migrate:prod": "wrangler d1 migrations apply lumanyi --remote"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.12.4",

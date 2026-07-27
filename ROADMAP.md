@@ -17,12 +17,12 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] Change default password flow / force password change on first login
 - [x] Assign job to a tech user (user picker)
 - [x] Create additional users (owner-only)
-- [ ] Photo uploads to R2 on job notes — **external (Cloudflare R2)** — deferred
+- [x] Photo uploads to R2 on job notes
 - [x] Soften secure-cookie for local HTTP without breaking production
 - [x] Basic Vitest coverage for health + login redirect
-- [ ] Replace placeholder D1 `database_id` after `wrangler d1 create` — **external** — deferred
+- [x] Replace placeholder D1 `database_id` after `wrangler d1 create`
 - [x] GitHub Actions CI workflow file added
-- [ ] Staging deploy on Cloudflare — **external** — deferred
+- [x] Staging deploy on Cloudflare (`lumanyi-staging` + `npm run deploy:staging`)
 - [x] Mobile-first tech job view (`/tech`)
 - [x] Error page + request id logging
 
