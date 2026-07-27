@@ -38,7 +38,7 @@ npm run dev
 
 Open http://localhost:8787  
 
-Default login: `owner@lumanyi.local` / `changeme`
+Default login: `owner@lumanyi.local` / `Lumanyi1!`
 
 ## Scripts
 

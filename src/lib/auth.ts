@@ -21,11 +21,11 @@ export async function ensureSeedUser(db: D1Database): Promise<void> {
 	if (row && row.c > 0) return;
 
 	const id = newId("usr");
-	const passwordHash = await hashPassword("changeme");
+	const passwordHash = await hashPassword("Lumanyi1!");
 	await db
 		.prepare(
 			`INSERT INTO users (id, email, name, password_hash, role, must_change_password)
-       VALUES (?, ?, ?, ?, ?, 1)`,
+       VALUES (?, ?, ?, ?, ?, 0)`,
 		)
 		.bind(id, "owner@lumanyi.local", "Owner", passwordHash, "owner")
 		.run();

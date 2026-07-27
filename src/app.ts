@@ -108,7 +108,7 @@ app.get("/login", async (c) => {
           </div>
           <button class="btn" type="submit">Sign in</button>
         </form>
-        <p class="muted">Default: owner@lumanyi.local / changeme — change after first login.</p>
+        <p class="muted">Default: owner@lumanyi.local / Lumanyi1! — change after first login if prompted.</p>
       </div>
     </div>`;
 	return c.html(layout({ title: "Sign in", body, user: null }));
@@ -254,12 +254,23 @@ app.post("/account/password", async (c) => {
 		}
 	}
 
-	const passwordHash = await hashPassword(newPassword);
-	await c.env.DB.prepare(
-		`UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?`,
-	)
-		.bind(passwordHash, user.id)
-		.run();
+	let passwordHash: string;
+	try {
+		passwordHash = await hashPassword(newPassword);
+	} catch (err) {
+		console.error("password hash failed", err);
+		return renderError("Could not hash password. Try a shorter password or try again.");
+	}
+	try {
+		await c.env.DB.prepare(
+			`UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?`,
+		)
+			.bind(passwordHash, user.id)
+			.run();
+	} catch (err) {
+		console.error("password update failed", err);
+		return renderError("Could not save password. Try again.");
+	}
 	return c.redirect("/");
 });
 
@@ -319,7 +330,7 @@ app.get("/users", async (c) => {
         </div>
         <div>
           <label for="temp_password">Temporary password</label>
-          <input id="temp_password" name="temp_password" type="text" required minlength="8" value="changeme1" />
+          <input id="temp_password" name="temp_password" type="text" required minlength="8" value="Lumanyi1!" />
         </div>
       </div>
       <p class="muted">New users must change password on first login.</p>

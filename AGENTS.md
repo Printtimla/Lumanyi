@@ -34,7 +34,7 @@ https://developers.cloudflare.com/d1/
 
 ## Auth seed
 
-Default user on empty DB: `owner@lumanyi.local` / `changeme` (forced password change on login).
+Default user on empty DB: `owner@lumanyi.local` / `Lumanyi1!`
 
 ## Schema
 
