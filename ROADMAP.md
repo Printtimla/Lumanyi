@@ -41,8 +41,8 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 
 ## Later — Print Ops (separate product shell)
 
-- [ ] Print job types + production statuses
-- [ ] Do not mix into Field Ops nav until shell exists
+- [x] Print job types + production statuses
+- [x] Print Ops nav shell (`/print`) separate from Field Ops jobs
 
 ## Bug triage rules (always)
 

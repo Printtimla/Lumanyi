@@ -162,7 +162,9 @@ tr:last-child td { border-bottom: none; }
 .badge.scheduled, .badge.in_progress { background: #ccfbf1; color: #0f766e; }
 .badge.complete, .badge.invoiced { background: #dcfce7; color: #166534; }
 .badge.lead, .badge.estimate { background: #fef3c7; color: #92400e; }
-.badge.cancelled { background: #fee2e2; color: #991b1b; }
+.badge.ready, .badge.delivered, .badge.approved { background: #dcfce7; color: #166534; }
+.badge.intake, .badge.proof { background: #fef3c7; color: #92400e; }
+.badge.in_production { background: #ccfbf1; color: #0f766e; }
 
 .stack { display: grid; gap: 0.75rem; }
 .row { display: grid; gap: 0.75rem; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }

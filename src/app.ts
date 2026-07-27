@@ -22,6 +22,12 @@ import { newId } from "./lib/ids";
 import { hashPassword, verifyPassword } from "./lib/password";
 import { generateDueRecurringJobs } from "./lib/recurring";
 import { buildEstimatePdf, syncJobEstimateTotal } from "./lib/estimate";
+import {
+	PRINT_PRODUCT_TYPES,
+	PRINT_STATUSES,
+	printProductLabel,
+	printStatusLabel,
+} from "./lib/print";
 
 export type Env = {
 	DB: D1Database;
@@ -1738,6 +1744,333 @@ app.post("/recurring/:id/toggle", async (c) => {
 		.bind(id)
 		.run();
 	return c.redirect("/recurring");
+});
+
+app.get("/print", async (c) => {
+	const status = c.req.query("status") || "";
+	const list = status
+		? await c.env.DB.prepare(
+				`SELECT p.*, c.name AS customer_name
+         FROM print_jobs p
+         LEFT JOIN customers c ON c.id = p.customer_id
+         WHERE p.status = ?
+         ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
+         LIMIT 100`,
+			)
+				.bind(status)
+				.all()
+		: await c.env.DB.prepare(
+				`SELECT p.*, c.name AS customer_name
+         FROM print_jobs p
+         LEFT JOIN customers c ON c.id = p.customer_id
+         WHERE p.status != 'cancelled'
+         ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
+         LIMIT 100`,
+			).all();
+
+	const rows =
+		(
+			list.results as Array<{
+				id: string;
+				title: string;
+				product_type: string;
+				status: string;
+				quantity: number | null;
+				due_date: string | null;
+				customer_name: string | null;
+			}>
+		)
+			?.map(
+				(p) => `<tr>
+        <td><a href="/print/${escapeHtml(p.id)}">${escapeHtml(p.title)}</a></td>
+        <td>${escapeHtml(p.customer_name) || "—"}</td>
+        <td>${escapeHtml(printProductLabel(p.product_type))}</td>
+        <td>${p.quantity ?? "—"}</td>
+        <td><span class="badge ${escapeHtml(p.status)}">${escapeHtml(printStatusLabel(p.status))}</span></td>
+        <td>${escapeHtml(p.due_date) || "—"}</td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="6" class="muted">No print jobs yet.</td></tr>`;
+
+	const filters = ["", ...PRINT_STATUSES.map((s) => s.value)]
+		.map((s) => {
+			const href = s ? `/print?status=${s}` : "/print";
+			const active = status === s ? "btn" : "btn secondary";
+			const label = s ? printStatusLabel(s) : "Open board";
+			return `<a class="${active}" href="${href}">${escapeHtml(label)}</a>`;
+		})
+		.join(" ");
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow">
+        <h1 style="margin:0">Print Ops</h1>
+        <p class="muted" style="margin:0.35rem 0 0">Separate product shell — not Field Ops restoration/cleaning jobs.</p>
+      </div>
+      <a class="btn" href="/print/new">New print job</a>
+    </div>
+    <div class="toolbar">${filters}</div>
+    <table>
+      <thead><tr><th>Job</th><th>Customer</th><th>Product</th><th>Qty</th><th>Status</th><th>Due</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+	return c.html(page(c, "Print Ops", body));
+});
+
+app.get("/print/new", async (c) => {
+	const customers = await c.env.DB.prepare(
+		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string }>();
+	const staff = await c.env.DB.prepare(
+		`SELECT id, name FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string }>();
+
+	const customerOptions =
+		customers.results
+			?.map(
+				(cu) =>
+					`<option value="${escapeHtml(cu.id)}">${escapeHtml(cu.name)}</option>`,
+			)
+			.join("") || "";
+	const staffOptions =
+		staff.results
+			?.map(
+				(u) =>
+					`<option value="${escapeHtml(u.id)}">${escapeHtml(u.name)}</option>`,
+			)
+			.join("") || "";
+	const productOptions = PRINT_PRODUCT_TYPES.map(
+		(p) =>
+			`<option value="${p.value}">${escapeHtml(p.label)}</option>`,
+	).join("");
+
+	const body = `
+    <h1>New print job</h1>
+    <form method="post" action="/print" class="panel stack">
+      <div>
+        <label for="customer_id">Customer (optional)</label>
+        <select id="customer_id" name="customer_id">
+          <option value="">Walk-in / TBD</option>
+          ${customerOptions}
+        </select>
+      </div>
+      <div><label for="title">Title</label><input id="title" name="title" required placeholder="Spring postcard drop" /></div>
+      <div class="row">
+        <div>
+          <label for="product_type">Product</label>
+          <select id="product_type" name="product_type" required>${productOptions}</select>
+        </div>
+        <div><label for="quantity">Quantity</label><input id="quantity" name="quantity" type="number" min="1" /></div>
+        <div><label for="due_date">Due date</label><input id="due_date" name="due_date" type="date" /></div>
+      </div>
+      <div>
+        <label for="assigned_user_id">Assigned to</label>
+        <select id="assigned_user_id" name="assigned_user_id">
+          <option value="">Unassigned</option>
+          ${staffOptions}
+        </select>
+      </div>
+      <div><label for="specs">Specs</label><textarea id="specs" name="specs" placeholder="Size, stock, color, finish, fold…"></textarea></div>
+      <div><label for="estimate_dollars">Estimate ($)</label><input id="estimate_dollars" name="estimate_dollars" type="number" step="0.01" min="0" /></div>
+      <div><label for="notes">Notes</label><textarea id="notes" name="notes"></textarea></div>
+      <button class="btn" type="submit">Create print job</button>
+    </form>`;
+
+	return c.html(page(c, "New print job", body));
+});
+
+app.post("/print", async (c) => {
+	const form = await c.req.parseBody();
+	const productType = String(form.product_type || "");
+	if (!PRINT_PRODUCT_TYPES.some((p) => p.value === productType)) {
+		return c.text("Invalid product type", 400);
+	}
+	const qtyRaw = String(form.quantity || "").trim();
+	const estimateRaw = String(form.estimate_dollars || "").trim();
+	const id = newId("prj");
+	await c.env.DB.prepare(
+		`INSERT INTO print_jobs (
+      id, customer_id, title, product_type, status, quantity, specs, due_date,
+      estimate_cents, notes, assigned_user_id
+    ) VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			id,
+			String(form.customer_id || "").trim() || null,
+			String(form.title || "").trim(),
+			productType,
+			qtyRaw ? Number(qtyRaw) : null,
+			String(form.specs || "").trim() || null,
+			String(form.due_date || "").trim() || null,
+			estimateRaw ? Math.round(parseFloat(estimateRaw) * 100) : null,
+			String(form.notes || "").trim() || null,
+			String(form.assigned_user_id || "").trim() || null,
+		)
+		.run();
+	return c.redirect(`/print/${id}`);
+});
+
+app.get("/print/:id", async (c) => {
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT p.*, c.name AS customer_name, u.name AS assignee_name
+     FROM print_jobs p
+     LEFT JOIN customers c ON c.id = p.customer_id
+     LEFT JOIN users u ON u.id = p.assigned_user_id
+     WHERE p.id = ?`,
+	)
+		.bind(id)
+		.first<{
+			id: string;
+			title: string;
+			product_type: string;
+			status: string;
+			quantity: number | null;
+			specs: string | null;
+			due_date: string | null;
+			estimate_cents: number | null;
+			notes: string | null;
+			customer_id: string | null;
+			customer_name: string | null;
+			assigned_user_id: string | null;
+			assignee_name: string | null;
+		}>();
+	if (!job) return c.notFound();
+
+	const staff = await c.env.DB.prepare(
+		`SELECT id, name FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string }>();
+	const customers = await c.env.DB.prepare(
+		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string }>();
+
+	const statusOptions = PRINT_STATUSES.map(
+		(s) =>
+			`<option value="${s.value}" ${job.status === s.value ? "selected" : ""}>${escapeHtml(s.label)}</option>`,
+	).join("");
+	const productOptions = PRINT_PRODUCT_TYPES.map(
+		(p) =>
+			`<option value="${p.value}" ${job.product_type === p.value ? "selected" : ""}>${escapeHtml(p.label)}</option>`,
+	).join("");
+	const staffOptions =
+		staff.results
+			?.map(
+				(u) =>
+					`<option value="${escapeHtml(u.id)}" ${job.assigned_user_id === u.id ? "selected" : ""}>${escapeHtml(u.name)}</option>`,
+			)
+			.join("") || "";
+	const customerOptions =
+		customers.results
+			?.map(
+				(cu) =>
+					`<option value="${escapeHtml(cu.id)}" ${job.customer_id === cu.id ? "selected" : ""}>${escapeHtml(cu.name)}</option>`,
+			)
+			.join("") || "";
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow">
+        <h1 style="margin:0">${escapeHtml(job.title)}</h1>
+        <p class="muted" style="margin:0.35rem 0 0">
+          Print Ops · ${escapeHtml(printProductLabel(job.product_type))}
+          · <span class="badge ${escapeHtml(job.status)}">${escapeHtml(printStatusLabel(job.status))}</span>
+        </p>
+      </div>
+      <a class="btn secondary" href="/print">All print jobs</a>
+    </div>
+    <div class="row" style="margin-top:1rem">
+      <div class="panel stack">
+        <div><span class="muted">Customer</span><br>${escapeHtml(job.customer_name) || "—"}</div>
+        <div><span class="muted">Assigned</span><br>${escapeHtml(job.assignee_name) || "Unassigned"}</div>
+        <div><span class="muted">Quantity</span><br>${job.quantity ?? "—"}</div>
+        <div><span class="muted">Due</span><br>${escapeHtml(job.due_date) || "—"}</div>
+        <div><span class="muted">Estimate</span><br>${escapeHtml(money(job.estimate_cents))}</div>
+        ${job.specs ? `<div><span class="muted">Specs</span><br>${escapeHtml(job.specs)}</div>` : ""}
+        ${job.notes ? `<div><span class="muted">Notes</span><br>${escapeHtml(job.notes)}</div>` : ""}
+      </div>
+      <div class="panel stack">
+        <h2 style="margin:0">Update</h2>
+        <form method="post" action="/print/${escapeHtml(id)}" class="stack">
+          <div><label for="title">Title</label><input id="title" name="title" required value="${escapeHtml(job.title)}" /></div>
+          <div class="row">
+            <div>
+              <label for="product_type">Product</label>
+              <select id="product_type" name="product_type">${productOptions}</select>
+            </div>
+            <div>
+              <label for="status">Status</label>
+              <select id="status" name="status">${statusOptions}</select>
+            </div>
+          </div>
+          <div>
+            <label for="customer_id">Customer</label>
+            <select id="customer_id" name="customer_id">
+              <option value="">Walk-in / TBD</option>
+              ${customerOptions}
+            </select>
+          </div>
+          <div>
+            <label for="assigned_user_id">Assigned to</label>
+            <select id="assigned_user_id" name="assigned_user_id">
+              <option value="">Unassigned</option>
+              ${staffOptions}
+            </select>
+          </div>
+          <div class="row">
+            <div><label for="quantity">Quantity</label>
+              <input id="quantity" name="quantity" type="number" min="1" value="${job.quantity ?? ""}" /></div>
+            <div><label for="due_date">Due date</label>
+              <input id="due_date" name="due_date" type="date" value="${escapeHtml(job.due_date)}" /></div>
+            <div><label for="estimate_dollars">Estimate ($)</label>
+              <input id="estimate_dollars" name="estimate_dollars" type="number" step="0.01" min="0"
+                value="${job.estimate_cents != null ? (job.estimate_cents / 100).toFixed(2) : ""}" /></div>
+          </div>
+          <div><label for="specs">Specs</label><textarea id="specs" name="specs">${escapeHtml(job.specs)}</textarea></div>
+          <div><label for="notes">Notes</label><textarea id="notes" name="notes">${escapeHtml(job.notes)}</textarea></div>
+          <button class="btn" type="submit">Save</button>
+        </form>
+      </div>
+    </div>`;
+
+	return c.html(page(c, job.title, body));
+});
+
+app.post("/print/:id", async (c) => {
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const productType = String(form.product_type || "");
+	const status = String(form.status || "");
+	if (!PRINT_PRODUCT_TYPES.some((p) => p.value === productType)) {
+		return c.text("Invalid product type", 400);
+	}
+	if (!PRINT_STATUSES.some((s) => s.value === status)) {
+		return c.text("Invalid status", 400);
+	}
+	const qtyRaw = String(form.quantity || "").trim();
+	const estimateRaw = String(form.estimate_dollars || "").trim();
+	await c.env.DB.prepare(
+		`UPDATE print_jobs SET
+      customer_id = ?, title = ?, product_type = ?, status = ?, quantity = ?,
+      specs = ?, due_date = ?, estimate_cents = ?, notes = ?, assigned_user_id = ?,
+      updated_at = datetime('now')
+     WHERE id = ?`,
+	)
+		.bind(
+			String(form.customer_id || "").trim() || null,
+			String(form.title || "").trim(),
+			productType,
+			status,
+			qtyRaw ? Number(qtyRaw) : null,
+			String(form.specs || "").trim() || null,
+			String(form.due_date || "").trim() || null,
+			estimateRaw ? Math.round(parseFloat(estimateRaw) * 100) : null,
+			String(form.notes || "").trim() || null,
+			String(form.assigned_user_id || "").trim() || null,
+			id,
+		)
+		.run();
+	return c.redirect(`/print/${id}`);
 });
 
 app.get("/tech", async (c) => {

@@ -33,6 +33,7 @@ export function layout(opts: {
 	}
 	if (opts.user) {
 		items.push({ href: "/recurring", label: "Recurring" });
+		items.push({ href: "/print", label: "Print" });
 		items.push({ href: "/tech", label: "Tech" });
 	}
 
