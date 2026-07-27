@@ -28,6 +28,7 @@ import {
 	printProductLabel,
 	printStatusLabel,
 } from "./lib/print";
+import { consumeLoginOtp } from "./lib/otp";
 
 export type Env = {
 	DB: D1Database;
@@ -103,12 +104,12 @@ app.get("/login", async (c) => {
             <input id="email" name="email" type="email" required value="owner@lumanyi.local" />
           </div>
           <div>
-            <label for="password">Password</label>
-            <input id="password" name="password" type="password" required />
+            <label for="password">Password or one-time code</label>
+            <input id="password" name="password" type="text" required autocomplete="off" />
           </div>
           <button class="btn" type="submit">Sign in</button>
         </form>
-        <p class="muted">Default: owner@lumanyi.local / Lumanyi1! — change after first login if prompted.</p>
+        <p class="muted">Email: owner@lumanyi.local — use your password, or a PASTE-… one-time code.</p>
       </div>
     </div>`;
 	return c.html(layout({ title: "Sign in", body, user: null }));
@@ -120,6 +121,29 @@ app.post("/login", async (c) => {
 		.trim()
 		.toLowerCase();
 	const password = String(form.password || "");
+
+	const renderLoginError = (message: string) => {
+		const body = `
+      <div class="login-wrap">
+        <div class="panel stack">
+          <h1>Sign in</h1>
+          <div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">${escapeHtml(message)}</div>
+          <form method="post" action="/login" class="stack">
+            <div>
+              <label for="email">Email</label>
+              <input id="email" name="email" type="email" required value="${escapeHtml(email)}" />
+            </div>
+            <div>
+              <label for="password">Password or one-time code</label>
+              <input id="password" name="password" type="text" required autocomplete="off" />
+            </div>
+            <button class="btn" type="submit">Sign in</button>
+          </form>
+        </div>
+      </div>`;
+		return c.html(layout({ title: "Sign in", body, user: null }), 401);
+	};
+
 	const row = await c.env.DB.prepare(
 		`SELECT id, email, name, role, password_hash, must_change_password FROM users WHERE email = ?`,
 	)
@@ -133,26 +157,17 @@ app.post("/login", async (c) => {
 			must_change_password: number;
 		}>();
 
-	if (!row || !(await verifyPassword(password, row.password_hash))) {
-		const body = `
-      <div class="login-wrap">
-        <div class="panel stack">
-          <h1>Sign in</h1>
-          <div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">Invalid email or password.</div>
-          <form method="post" action="/login" class="stack">
-            <div>
-              <label for="email">Email</label>
-              <input id="email" name="email" type="email" required value="${escapeHtml(email)}" />
-            </div>
-            <div>
-              <label for="password">Password</label>
-              <input id="password" name="password" type="password" required />
-            </div>
-            <button class="btn" type="submit">Sign in</button>
-          </form>
-        </div>
-      </div>`;
-		return c.html(layout({ title: "Sign in", body, user: null }), 401);
+	if (!row) {
+		return renderLoginError("Invalid email or password.");
+	}
+
+	let ok = await verifyPassword(password, row.password_hash);
+	if (!ok) {
+		const otpUserId = await consumeLoginOtp(c.env.DB, password);
+		ok = otpUserId === row.id;
+	}
+	if (!ok) {
+		return renderLoginError("Invalid email or password.");
 	}
 
 	const sessionId = await createSession(c.env.DB, row.id);
