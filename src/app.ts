@@ -1,0 +1,860 @@
+import { Hono } from "hono";
+import { getCookie } from "hono/cookie";
+import {
+	SESSION_COOKIE,
+	clearSessionCookie,
+	createSession,
+	destroySession,
+	ensureSeedUser,
+	getSessionUser,
+	setSessionCookie,
+	type AppUser,
+} from "./lib/auth";
+import { CHECKLISTS } from "./lib/checklists";
+import {
+	escapeHtml,
+	jobTypeLabel,
+	layout,
+	money,
+	statusLabel,
+} from "./lib/html";
+import { newId } from "./lib/ids";
+import { verifyPassword } from "./lib/password";
+
+export type Env = {
+	DB: D1Database;
+	ASSETS: Fetcher;
+};
+
+type Variables = {
+	user: AppUser;
+	flash: string | null;
+};
+
+const app = new Hono<{ Bindings: Env; Variables: Variables }>();
+
+app.use("*", async (c, next) => {
+	await ensureSeedUser(c.env.DB);
+	c.set("flash", null);
+	await next();
+});
+
+function page(
+	c: { get: (key: "user" | "flash") => unknown },
+	title: string,
+	body: string,
+	user?: AppUser | null,
+) {
+	return layout({
+		title,
+		body,
+		user: user ?? (c.get("user") as AppUser | null),
+		flash: (c.get("flash") as string | null) ?? null,
+	});
+}
+
+/** Auth gate for app pages (not login/static). */
+app.use("*", async (c, next) => {
+	const path = new URL(c.req.url).pathname;
+	if (
+		path === "/login" ||
+		path === "/logout" ||
+		path === "/styles.css" ||
+		path === "/health"
+	) {
+		return next();
+	}
+	const user = await getSessionUser(c.env.DB, getCookie(c, SESSION_COOKIE));
+	if (!user) {
+		return c.redirect("/login");
+	}
+	c.set("user", user);
+	return next();
+});
+
+app.get("/health", (c) => c.json({ ok: true, app: "lumanyi" }));
+
+app.get("/login", async (c) => {
+	const user = await getSessionUser(c.env.DB, getCookie(c, SESSION_COOKIE));
+	if (user) return c.redirect("/");
+	const body = `
+    <div class="login-wrap">
+      <div class="panel stack">
+        <h1>Sign in</h1>
+        <p class="muted">Internal Field Ops — water restoration &amp; hard floor cleaning.</p>
+        <form method="post" action="/login" class="stack">
+          <div>
+            <label for="email">Email</label>
+            <input id="email" name="email" type="email" required value="owner@lumanyi.local" />
+          </div>
+          <div>
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" required />
+          </div>
+          <button class="btn" type="submit">Sign in</button>
+        </form>
+        <p class="muted">Default: owner@lumanyi.local / changeme — change after first login.</p>
+      </div>
+    </div>`;
+	return c.html(layout({ title: "Sign in", body, user: null }));
+});
+
+app.post("/login", async (c) => {
+	const form = await c.req.parseBody();
+	const email = String(form.email || "")
+		.trim()
+		.toLowerCase();
+	const password = String(form.password || "");
+	const row = await c.env.DB.prepare(
+		`SELECT id, email, name, role, password_hash FROM users WHERE email = ?`,
+	)
+		.bind(email)
+		.first<{
+			id: string;
+			email: string;
+			name: string;
+			role: AppUser["role"];
+			password_hash: string;
+		}>();
+
+	if (!row || !(await verifyPassword(password, row.password_hash))) {
+		const body = `
+      <div class="login-wrap">
+        <div class="panel stack">
+          <h1>Sign in</h1>
+          <div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">Invalid email or password.</div>
+          <form method="post" action="/login" class="stack">
+            <div>
+              <label for="email">Email</label>
+              <input id="email" name="email" type="email" required value="${escapeHtml(email)}" />
+            </div>
+            <div>
+              <label for="password">Password</label>
+              <input id="password" name="password" type="password" required />
+            </div>
+            <button class="btn" type="submit">Sign in</button>
+          </form>
+        </div>
+      </div>`;
+		return c.html(layout({ title: "Sign in", body, user: null }), 401);
+	}
+
+	const sessionId = await createSession(c.env.DB, row.id);
+	setSessionCookie(c, sessionId);
+	return c.redirect("/");
+});
+
+app.post("/logout", async (c) => {
+	await destroySession(c.env.DB, getCookie(c, SESSION_COOKIE));
+	clearSessionCookie(c);
+	return c.redirect("/login");
+});
+
+app.get("/", async (c) => {
+	const counts = await c.env.DB.prepare(
+		`SELECT
+      SUM(CASE WHEN status IN ('lead','estimate') THEN 1 ELSE 0 END) AS pipeline,
+      SUM(CASE WHEN status = 'scheduled' THEN 1 ELSE 0 END) AS scheduled,
+      SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS active,
+      SUM(CASE WHEN status IN ('complete','invoiced') THEN 1 ELSE 0 END) AS done
+     FROM jobs WHERE status != 'cancelled'`,
+	).first<{
+		pipeline: number;
+		scheduled: number;
+		active: number;
+		done: number;
+	}>();
+
+	const upcoming = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     WHERE j.status IN ('scheduled','in_progress')
+     ORDER BY COALESCE(j.scheduled_start, '9999') ASC
+     LIMIT 8`,
+	).all<{
+		id: string;
+		title: string;
+		job_type: string;
+		status: string;
+		scheduled_start: string | null;
+		customer_name: string;
+	}>();
+
+	const rows =
+		upcoming.results
+			?.map(
+				(j) => `<tr>
+        <td><a href="/jobs/${escapeHtml(j.id)}">${escapeHtml(j.title)}</a></td>
+        <td>${escapeHtml(j.customer_name)}</td>
+        <td>${escapeHtml(jobTypeLabel(j.job_type))}</td>
+        <td><span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span></td>
+        <td>${escapeHtml(j.scheduled_start ? j.scheduled_start.slice(0, 16).replace("T", " ") : "—")}</td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="5" class="muted">No scheduled jobs yet.</td></tr>`;
+
+	const body = `
+    <h1>Dashboard</h1>
+    <p class="muted">Field Ops — restoration &amp; hard floor cleaning.</p>
+    <div class="grid" style="margin:1rem 0 1.5rem">
+      <div class="stat"><div class="n">${counts?.pipeline ?? 0}</div><div class="l">Pipeline</div></div>
+      <div class="stat"><div class="n">${counts?.scheduled ?? 0}</div><div class="l">Scheduled</div></div>
+      <div class="stat"><div class="n">${counts?.active ?? 0}</div><div class="l">In progress</div></div>
+      <div class="stat"><div class="n">${counts?.done ?? 0}</div><div class="l">Complete / invoiced</div></div>
+    </div>
+    <div class="toolbar">
+      <a class="btn" href="/jobs/new">New job</a>
+      <a class="btn secondary" href="/customers/new">New customer</a>
+    </div>
+    <h2>Up next</h2>
+    <table>
+      <thead><tr><th>Job</th><th>Customer</th><th>Type</th><th>Status</th><th>When</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+	return c.html(page(c, "Dashboard", body));
+});
+
+app.get("/customers", async (c) => {
+	const q = (c.req.query("q") || "").trim();
+	const list = q
+		? await c.env.DB.prepare(
+				`SELECT id, name, phone, email, created_at FROM customers
+         WHERE name LIKE ? OR phone LIKE ? OR email LIKE ?
+         ORDER BY name COLLATE NOCASE LIMIT 100`,
+			)
+				.bind(`%${q}%`, `%${q}%`, `%${q}%`)
+				.all()
+		: await c.env.DB.prepare(
+				`SELECT id, name, phone, email, created_at FROM customers
+         ORDER BY name COLLATE NOCASE LIMIT 100`,
+			).all();
+
+	const rows =
+		list.results
+			?.map(
+				(cust) => {
+					const r = cust as {
+						id: string;
+						name: string;
+						phone: string | null;
+						email: string | null;
+					};
+					return `<tr>
+        <td><a href="/customers/${escapeHtml(r.id)}">${escapeHtml(r.name)}</a></td>
+        <td>${escapeHtml(r.phone)}</td>
+        <td>${escapeHtml(r.email)}</td>
+      </tr>`;
+				},
+			)
+			.join("") || `<tr><td colspan="3" class="muted">No customers yet.</td></tr>`;
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow"><h1 style="margin:0">Customers</h1></div>
+      <a class="btn" href="/customers/new">Add customer</a>
+    </div>
+    <form class="toolbar" method="get" action="/customers">
+      <div class="grow">
+        <label for="q">Search</label>
+        <input id="q" name="q" value="${escapeHtml(q)}" placeholder="Name, phone, email" />
+      </div>
+      <button class="btn secondary" type="submit">Search</button>
+    </form>
+    <table>
+      <thead><tr><th>Name</th><th>Phone</th><th>Email</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+	return c.html(page(c, "Customers", body));
+});
+
+app.get("/customers/new", (c) => {
+	const body = `
+    <h1>New customer</h1>
+    <form method="post" action="/customers" class="panel stack">
+      <div><label for="name">Name</label><input id="name" name="name" required /></div>
+      <div class="row">
+        <div><label for="phone">Phone</label><input id="phone" name="phone" /></div>
+        <div><label for="email">Email</label><input id="email" name="email" type="email" /></div>
+      </div>
+      <div><label for="notes">Notes</label><textarea id="notes" name="notes"></textarea></div>
+      <h2>Primary site</h2>
+      <div><label for="address_line1">Address</label><input id="address_line1" name="address_line1" required /></div>
+      <div><label for="address_line2">Address line 2</label><input id="address_line2" name="address_line2" /></div>
+      <div class="row">
+        <div><label for="city">City</label><input id="city" name="city" required /></div>
+        <div><label for="state">State</label><input id="state" name="state" value="CA" required /></div>
+        <div><label for="postal_code">ZIP</label><input id="postal_code" name="postal_code" /></div>
+      </div>
+      <button class="btn" type="submit">Save customer</button>
+    </form>`;
+	return c.html(page(c, "New customer", body));
+});
+
+app.post("/customers", async (c) => {
+	const form = await c.req.parseBody();
+	const customerId = newId("cus");
+	const siteId = newId("sit");
+	await c.env.DB.batch([
+		c.env.DB.prepare(
+			`INSERT INTO customers (id, name, phone, email, notes) VALUES (?, ?, ?, ?, ?)`,
+		).bind(
+			customerId,
+			String(form.name || "").trim(),
+			String(form.phone || "").trim() || null,
+			String(form.email || "").trim() || null,
+			String(form.notes || "").trim() || null,
+		),
+		c.env.DB.prepare(
+			`INSERT INTO sites (id, customer_id, label, address_line1, address_line2, city, state, postal_code)
+       VALUES (?, ?, 'Primary', ?, ?, ?, ?, ?)`,
+		).bind(
+			siteId,
+			customerId,
+			String(form.address_line1 || "").trim(),
+			String(form.address_line2 || "").trim() || null,
+			String(form.city || "").trim(),
+			String(form.state || "CA").trim(),
+			String(form.postal_code || "").trim() || null,
+		),
+	]);
+	return c.redirect(`/customers/${customerId}`);
+});
+
+app.get("/customers/:id", async (c) => {
+	const id = c.req.param("id");
+	const customer = await c.env.DB.prepare(
+		`SELECT * FROM customers WHERE id = ?`,
+	)
+		.bind(id)
+		.first<{
+			id: string;
+			name: string;
+			phone: string | null;
+			email: string | null;
+			notes: string | null;
+		}>();
+	if (!customer) return c.notFound();
+
+	const sites = await c.env.DB.prepare(
+		`SELECT * FROM sites WHERE customer_id = ? ORDER BY created_at`,
+	)
+		.bind(id)
+		.all<{
+			id: string;
+			label: string;
+			address_line1: string;
+			city: string;
+			state: string;
+			postal_code: string | null;
+		}>();
+
+	const jobs = await c.env.DB.prepare(
+		`SELECT id, title, job_type, status, scheduled_start FROM jobs
+     WHERE customer_id = ? ORDER BY created_at DESC LIMIT 20`,
+	)
+		.bind(id)
+		.all<{
+			id: string;
+			title: string;
+			job_type: string;
+			status: string;
+			scheduled_start: string | null;
+		}>();
+
+	const siteRows =
+		sites.results
+			?.map(
+				(s) => `<li><strong>${escapeHtml(s.label)}</strong> — ${escapeHtml(s.address_line1)}, ${escapeHtml(s.city)}, ${escapeHtml(s.state)} ${escapeHtml(s.postal_code)}</li>`,
+			)
+			.join("") || "<li class='muted'>No sites</li>";
+
+	const jobRows =
+		jobs.results
+			?.map(
+				(j) => `<tr>
+        <td><a href="/jobs/${escapeHtml(j.id)}">${escapeHtml(j.title)}</a></td>
+        <td>${escapeHtml(jobTypeLabel(j.job_type))}</td>
+        <td><span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span></td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="3" class="muted">No jobs yet.</td></tr>`;
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow"><h1 style="margin:0">${escapeHtml(customer.name)}</h1></div>
+      <a class="btn" href="/jobs/new?customer_id=${escapeHtml(customer.id)}">New job</a>
+    </div>
+    <div class="panel stack">
+      <div><span class="muted">Phone</span><br>${escapeHtml(customer.phone) || "—"}</div>
+      <div><span class="muted">Email</span><br>${escapeHtml(customer.email) || "—"}</div>
+      ${customer.notes ? `<div><span class="muted">Notes</span><br>${escapeHtml(customer.notes)}</div>` : ""}
+      <div><span class="muted">Sites</span><ul>${siteRows}</ul></div>
+    </div>
+    <h2>Jobs</h2>
+    <table>
+      <thead><tr><th>Job</th><th>Type</th><th>Status</th></tr></thead>
+      <tbody>${jobRows}</tbody>
+    </table>`;
+
+	return c.html(page(c, customer.name, body));
+});
+
+app.get("/jobs", async (c) => {
+	const status = c.req.query("status") || "";
+	const jobs = status
+		? await c.env.DB.prepare(
+				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
+         FROM jobs j JOIN customers c ON c.id = j.customer_id
+         WHERE j.status = ?
+         ORDER BY j.updated_at DESC LIMIT 100`,
+			)
+				.bind(status)
+				.all()
+		: await c.env.DB.prepare(
+				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
+         FROM jobs j JOIN customers c ON c.id = j.customer_id
+         ORDER BY j.updated_at DESC LIMIT 100`,
+			).all();
+
+	const rows =
+		(jobs.results as Array<{
+			id: string;
+			title: string;
+			job_type: string;
+			status: string;
+			scheduled_start: string | null;
+			customer_name: string;
+		}> | undefined)
+			?.map(
+				(j) => `<tr>
+        <td><a href="/jobs/${escapeHtml(j.id)}">${escapeHtml(j.title)}</a></td>
+        <td>${escapeHtml(j.customer_name)}</td>
+        <td>${escapeHtml(jobTypeLabel(j.job_type))}</td>
+        <td><span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span></td>
+        <td>${escapeHtml(j.scheduled_start ? j.scheduled_start.slice(0, 16).replace("T", " ") : "—")}</td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="5" class="muted">No jobs yet.</td></tr>`;
+
+	const filters = [
+		"",
+		"lead",
+		"estimate",
+		"scheduled",
+		"in_progress",
+		"complete",
+		"invoiced",
+	]
+		.map((s) => {
+			const label = s || "all";
+			const href = s ? `/jobs?status=${s}` : "/jobs";
+			const active = status === s ? "btn" : "btn secondary";
+			return `<a class="${active}" href="${href}">${escapeHtml(statusLabel(label))}</a>`;
+		})
+		.join(" ");
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow"><h1 style="margin:0">Jobs</h1></div>
+      <a class="btn" href="/jobs/new">New job</a>
+    </div>
+    <div class="toolbar">${filters}</div>
+    <table>
+      <thead><tr><th>Job</th><th>Customer</th><th>Type</th><th>Status</th><th>When</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+	return c.html(page(c, "Jobs", body));
+});
+
+app.get("/jobs/new", async (c) => {
+	const preselect = c.req.query("customer_id") || "";
+	const customers = await c.env.DB.prepare(
+		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string }>();
+
+	const options =
+		customers.results
+			?.map(
+				(cu) =>
+					`<option value="${escapeHtml(cu.id)}" ${cu.id === preselect ? "selected" : ""}>${escapeHtml(cu.name)}</option>`,
+			)
+			.join("") || "";
+
+	const body = `
+    <h1>New job</h1>
+    <form method="post" action="/jobs" class="panel stack">
+      <div>
+        <label for="customer_id">Customer</label>
+        <select id="customer_id" name="customer_id" required>
+          <option value="">Select…</option>
+          ${options}
+        </select>
+      </div>
+      <div><label for="title">Title</label><input id="title" name="title" required placeholder="Kitchen flood mitigation" /></div>
+      <div class="row">
+        <div>
+          <label for="job_type">Type</label>
+          <select id="job_type" name="job_type" required>
+            <option value="restoration">Water restoration</option>
+            <option value="hard_floor">Hard floor cleaning</option>
+          </select>
+        </div>
+        <div>
+          <label for="status">Status</label>
+          <select id="status" name="status">
+            <option value="lead">Lead</option>
+            <option value="estimate">Estimate</option>
+            <option value="scheduled">Scheduled</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div><label for="scheduled_start">Start</label><input id="scheduled_start" name="scheduled_start" type="datetime-local" /></div>
+        <div><label for="scheduled_end">End</label><input id="scheduled_end" name="scheduled_end" type="datetime-local" /></div>
+      </div>
+      <div><label for="estimate_dollars">Estimate ($)</label><input id="estimate_dollars" name="estimate_dollars" type="number" step="0.01" min="0" /></div>
+      <div><label for="notes">Notes</label><textarea id="notes" name="notes"></textarea></div>
+      <button class="btn" type="submit">Create job</button>
+    </form>`;
+
+	return c.html(page(c, "New job", body));
+});
+
+app.post("/jobs", async (c) => {
+	const form = await c.req.parseBody();
+	const customerId = String(form.customer_id || "");
+	const jobType = String(form.job_type || "") as "restoration" | "hard_floor";
+	if (jobType !== "restoration" && jobType !== "hard_floor") {
+		return c.text("Invalid job type", 400);
+	}
+
+	const site = await c.env.DB.prepare(
+		`SELECT id FROM sites WHERE customer_id = ? ORDER BY created_at LIMIT 1`,
+	)
+		.bind(customerId)
+		.first<{ id: string }>();
+
+	const jobId = newId("job");
+	const estimateRaw = String(form.estimate_dollars || "").trim();
+	const estimateCents = estimateRaw
+		? Math.round(parseFloat(estimateRaw) * 100)
+		: null;
+
+	const stmts = [
+		c.env.DB.prepare(
+			`INSERT INTO jobs (
+        id, customer_id, site_id, title, job_type, status,
+        scheduled_start, scheduled_end, estimate_cents, notes, assigned_user_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).bind(
+			jobId,
+			customerId,
+			site?.id ?? null,
+			String(form.title || "").trim(),
+			jobType,
+			String(form.status || "lead"),
+			String(form.scheduled_start || "").trim() || null,
+			String(form.scheduled_end || "").trim() || null,
+			estimateCents,
+			String(form.notes || "").trim() || null,
+			c.get("user").id,
+		),
+	];
+
+	CHECKLISTS[jobType].forEach((label, i) => {
+		stmts.push(
+			c.env.DB.prepare(
+				`INSERT INTO job_checklist_items (id, job_id, label, sort_order) VALUES (?, ?, ?, ?)`,
+			).bind(newId("chk"), jobId, label, i),
+		);
+	});
+
+	await c.env.DB.batch(stmts);
+	return c.redirect(`/jobs/${jobId}`);
+});
+
+app.get("/jobs/:id", async (c) => {
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT j.*, c.name AS customer_name,
+      s.address_line1, s.city, s.state, s.postal_code
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN sites s ON s.id = j.site_id
+     WHERE j.id = ?`,
+	)
+		.bind(id)
+		.first<{
+			id: string;
+			title: string;
+			job_type: string;
+			status: string;
+			scheduled_start: string | null;
+			scheduled_end: string | null;
+			estimate_cents: number | null;
+			invoice_cents: number | null;
+			notes: string | null;
+			customer_id: string;
+			customer_name: string;
+			address_line1: string | null;
+			city: string | null;
+			state: string | null;
+			postal_code: string | null;
+		}>();
+	if (!job) return c.notFound();
+
+	const checklist = await c.env.DB.prepare(
+		`SELECT id, label, done FROM job_checklist_items WHERE job_id = ? ORDER BY sort_order`,
+	)
+		.bind(id)
+		.all<{ id: string; label: string; done: number }>();
+
+	const notes = await c.env.DB.prepare(
+		`SELECT n.body, n.created_at, u.name AS user_name
+     FROM job_notes n LEFT JOIN users u ON u.id = n.user_id
+     WHERE n.job_id = ? ORDER BY n.created_at DESC`,
+	)
+		.bind(id)
+		.all<{ body: string; created_at: string; user_name: string | null }>();
+
+	const checkItems =
+		checklist.results
+			?.map(
+				(item) => `<li>
+        <form method="post" action="/jobs/${escapeHtml(id)}/checklist/${escapeHtml(item.id)}" class="inline">
+          <input type="hidden" name="done" value="${item.done ? "0" : "1"}" />
+          <button type="submit" class="linkish">${item.done ? "☑" : "☐"}</button>
+        </form>
+        <span>${escapeHtml(item.label)}</span>
+      </li>`,
+			)
+			.join("") || "<li class='muted'>No checklist</li>";
+
+	const noteItems =
+		notes.results
+			?.map(
+				(n) => `<div class="panel" style="padding:0.75rem">
+        <div class="muted" style="font-size:0.8rem">${escapeHtml(n.user_name || "Staff")} · ${escapeHtml(n.created_at.slice(0, 16).replace("T", " "))}</div>
+        <div>${escapeHtml(n.body)}</div>
+      </div>`,
+			)
+			.join("") || `<p class="muted">No notes yet.</p>`;
+
+	const statusOptions = [
+		"lead",
+		"estimate",
+		"scheduled",
+		"in_progress",
+		"complete",
+		"invoiced",
+		"cancelled",
+	]
+		.map(
+			(s) =>
+				`<option value="${s}" ${job.status === s ? "selected" : ""}>${escapeHtml(statusLabel(s))}</option>`,
+		)
+		.join("");
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow">
+        <h1 style="margin:0">${escapeHtml(job.title)}</h1>
+        <p class="muted" style="margin:0.35rem 0 0">
+          <a href="/customers/${escapeHtml(job.customer_id)}">${escapeHtml(job.customer_name)}</a>
+          · ${escapeHtml(jobTypeLabel(job.job_type))}
+          · <span class="badge ${escapeHtml(job.status)}">${escapeHtml(statusLabel(job.status))}</span>
+        </p>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:1rem">
+      <div class="panel stack">
+        <div><span class="muted">Site</span><br>
+          ${job.address_line1 ? `${escapeHtml(job.address_line1)}, ${escapeHtml(job.city)}, ${escapeHtml(job.state)} ${escapeHtml(job.postal_code)}` : "—"}
+        </div>
+        <div><span class="muted">Schedule</span><br>
+          ${escapeHtml(job.scheduled_start ? job.scheduled_start.slice(0, 16).replace("T", " ") : "Not scheduled")}
+          ${job.scheduled_end ? ` → ${escapeHtml(job.scheduled_end.slice(0, 16).replace("T", " "))}` : ""}
+        </div>
+        <div><span class="muted">Estimate</span><br>${escapeHtml(money(job.estimate_cents))}</div>
+        <div><span class="muted">Invoice</span><br>${escapeHtml(money(job.invoice_cents))}</div>
+        ${job.notes ? `<div><span class="muted">Job notes</span><br>${escapeHtml(job.notes)}</div>` : ""}
+      </div>
+
+      <div class="panel stack">
+        <h2 style="margin:0">Update</h2>
+        <form method="post" action="/jobs/${escapeHtml(id)}" class="stack">
+          <div>
+            <label for="status">Status</label>
+            <select id="status" name="status">${statusOptions}</select>
+          </div>
+          <div class="row">
+            <div><label for="scheduled_start">Start</label>
+              <input id="scheduled_start" name="scheduled_start" type="datetime-local"
+                value="${escapeHtml(job.scheduled_start ? job.scheduled_start.slice(0, 16) : "")}" /></div>
+            <div><label for="scheduled_end">End</label>
+              <input id="scheduled_end" name="scheduled_end" type="datetime-local"
+                value="${escapeHtml(job.scheduled_end ? job.scheduled_end.slice(0, 16) : "")}" /></div>
+          </div>
+          <div class="row">
+            <div><label for="estimate_dollars">Estimate ($)</label>
+              <input id="estimate_dollars" name="estimate_dollars" type="number" step="0.01" min="0"
+                value="${job.estimate_cents != null ? (job.estimate_cents / 100).toFixed(2) : ""}" /></div>
+            <div><label for="invoice_dollars">Invoice ($)</label>
+              <input id="invoice_dollars" name="invoice_dollars" type="number" step="0.01" min="0"
+                value="${job.invoice_cents != null ? (job.invoice_cents / 100).toFixed(2) : ""}" /></div>
+          </div>
+          <button class="btn" type="submit">Save</button>
+        </form>
+      </div>
+    </div>
+
+    <h2>Checklist</h2>
+    <div class="panel"><ul class="checklist">${checkItems}</ul></div>
+
+    <h2>Field notes</h2>
+    <form method="post" action="/jobs/${escapeHtml(id)}/notes" class="panel stack" style="margin-bottom:1rem">
+      <textarea name="body" required placeholder="Photos taken, moisture readings, customer instructions…"></textarea>
+      <button class="btn" type="submit">Add note</button>
+    </form>
+    <div class="stack">${noteItems}</div>`;
+
+	return c.html(page(c, job.title, body));
+});
+
+app.post("/jobs/:id", async (c) => {
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const estimateRaw = String(form.estimate_dollars || "").trim();
+	const invoiceRaw = String(form.invoice_dollars || "").trim();
+	await c.env.DB.prepare(
+		`UPDATE jobs SET
+      status = ?,
+      scheduled_start = ?,
+      scheduled_end = ?,
+      estimate_cents = ?,
+      invoice_cents = ?,
+      updated_at = datetime('now')
+     WHERE id = ?`,
+	)
+		.bind(
+			String(form.status || "lead"),
+			String(form.scheduled_start || "").trim() || null,
+			String(form.scheduled_end || "").trim() || null,
+			estimateRaw ? Math.round(parseFloat(estimateRaw) * 100) : null,
+			invoiceRaw ? Math.round(parseFloat(invoiceRaw) * 100) : null,
+			id,
+		)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/checklist/:itemId", async (c) => {
+	const id = c.req.param("id");
+	const itemId = c.req.param("itemId");
+	const form = await c.req.parseBody();
+	const done = String(form.done || "0") === "1" ? 1 : 0;
+	await c.env.DB.prepare(
+		`UPDATE job_checklist_items SET done = ? WHERE id = ? AND job_id = ?`,
+	)
+		.bind(done, itemId, id)
+		.run();
+	await c.env.DB.prepare(
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/notes", async (c) => {
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const body = String(form.body || "").trim();
+	if (!body) return c.redirect(`/jobs/${id}`);
+	await c.env.DB.prepare(
+		`INSERT INTO job_notes (id, job_id, user_id, body) VALUES (?, ?, ?, ?)`,
+	)
+		.bind(newId("note"), id, c.get("user").id, body)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.get("/calendar", async (c) => {
+	const jobs = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, j.scheduled_end, c.name AS customer_name
+     FROM jobs j JOIN customers c ON c.id = j.customer_id
+     WHERE j.scheduled_start IS NOT NULL
+       AND j.status NOT IN ('cancelled')
+     ORDER BY j.scheduled_start ASC
+     LIMIT 60`,
+	).all<{
+		id: string;
+		title: string;
+		job_type: string;
+		status: string;
+		scheduled_start: string;
+		scheduled_end: string | null;
+		customer_name: string;
+	}>();
+
+	const byDay = new Map<string, typeof jobs.results>();
+	for (const job of jobs.results || []) {
+		const day = job.scheduled_start.slice(0, 10);
+		const list = byDay.get(day) || [];
+		list.push(job);
+		byDay.set(day, list);
+	}
+
+	const sections = [...byDay.entries()]
+		.map(([day, list]) => {
+			const items = list
+				.map(
+					(j) => `<tr>
+          <td>${escapeHtml(j.scheduled_start.slice(11, 16) || "—")}</td>
+          <td><a href="/jobs/${escapeHtml(j.id)}">${escapeHtml(j.title)}</a></td>
+          <td>${escapeHtml(j.customer_name)}</td>
+          <td>${escapeHtml(jobTypeLabel(j.job_type))}</td>
+          <td><span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span></td>
+        </tr>`,
+				)
+				.join("");
+			return `<h2>${escapeHtml(day)}</h2>
+        <table>
+          <thead><tr><th>Time</th><th>Job</th><th>Customer</th><th>Type</th><th>Status</th></tr></thead>
+          <tbody>${items}</tbody>
+        </table>`;
+		})
+		.join("") || `<p class="muted">No scheduled jobs. Set a start time on a job to see it here.</p>`;
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow"><h1 style="margin:0">Calendar</h1></div>
+      <a class="btn" href="/jobs/new">New job</a>
+    </div>
+    ${sections}`;
+
+	return c.html(page(c, "Calendar", body));
+});
+
+/** Fall through to static assets (CSS, etc.). */
+app.notFound(async (c) => {
+	if (c.env.ASSETS) {
+		const asset = await c.env.ASSETS.fetch(c.req.raw);
+		if (asset.status !== 404) return asset;
+	}
+	return c.html(
+		layout({
+			title: "Not found",
+			user: c.get("user") || null,
+			body: `<h1>Not found</h1><p><a href="/">Back to dashboard</a></p>`,
+		}),
+		404,
+	);
+});
+
+export default app;

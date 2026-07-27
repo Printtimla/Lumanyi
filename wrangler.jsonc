@@ -1,0 +1,32 @@
+/**
+ * Lumanyi — internal Field Ops on Cloudflare Workers.
+ * https://developers.cloudflare.com/workers/
+ * https://developers.cloudflare.com/d1/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "lumanyi",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-03-10",
+	"compatibility_flags": [
+		"nodejs_compat",
+		"global_fetch_strictly_public"
+	],
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS",
+		"run_worker_first": true
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "lumanyi",
+			"database_id": "local-lumanyi-db",
+			"migrations_dir": "migrations"
+		}
+	],
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true
+}
