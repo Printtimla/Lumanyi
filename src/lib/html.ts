@@ -1,4 +1,5 @@
 import type { AppUser } from "./auth";
+import { roleLabel } from "./roles";
 
 export function escapeHtml(value: string | number | null | undefined): string {
 	return String(value ?? "")
@@ -45,7 +46,7 @@ export function layout(opts: {
 
 	const userBar = opts.user
 		? `<div class="userbar">
-        <span>${escapeHtml(opts.user.name)} · ${escapeHtml(opts.user.role)}</span>
+        <span>${escapeHtml(opts.user.name)} · ${escapeHtml(roleLabel(opts.user.role))}</span>
         <a href="/account/password">Password</a>
         <form method="post" action="/logout" class="inline">
           <button type="submit" class="linkish">Log out</button>

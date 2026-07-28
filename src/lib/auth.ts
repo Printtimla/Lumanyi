@@ -2,12 +2,13 @@ import type { Context } from "hono";
 import { setCookie, deleteCookie } from "hono/cookie";
 import { newId } from "./ids";
 import { hashPassword } from "./password";
+import type { UserRole } from "./roles";
 
 export type AppUser = {
 	id: string;
 	email: string;
 	name: string;
-	role: "owner" | "dispatcher" | "tech";
+	role: UserRole;
 	mustChangePassword: boolean;
 };
 

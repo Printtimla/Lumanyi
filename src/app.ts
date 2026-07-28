@@ -43,6 +43,12 @@ import {
 	normalizeJobType,
 } from "./lib/products";
 import {
+	assigneeOptionLabel,
+	isValidUserRole,
+	roleLabel,
+	USER_ROLES,
+} from "./lib/roles";
+import {
 	EQUIPMENT_TYPES,
 	equipmentTypeLabel,
 	type FieldLogRow,
@@ -337,7 +343,7 @@ app.get("/users", async (c) => {
 				(u) => `<tr>
         <td>${escapeHtml(u.name)}</td>
         <td>${escapeHtml(u.email)}</td>
-        <td>${escapeHtml(u.role)}</td>
+        <td>${escapeHtml(roleLabel(u.role))}</td>
         <td>${u.must_change_password ? "Must change" : "OK"}</td>
       </tr>`,
 			)
@@ -348,7 +354,7 @@ app.get("/users", async (c) => {
       <div class="grow"><h1 style="margin:0">Users</h1></div>
     </div>
     <table>
-      <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Password</th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th>Designation</th><th>Password</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <h2>Add user</h2>
@@ -359,11 +365,12 @@ app.get("/users", async (c) => {
       </div>
       <div class="row">
         <div>
-          <label for="role">Role</label>
+          <label for="role">Designation</label>
           <select id="role" name="role" required>
-            <option value="tech">Tech</option>
-            <option value="dispatcher">Dispatcher</option>
-            <option value="owner">Owner</option>
+            ${USER_ROLES.map(
+							(r) =>
+								`<option value="${escapeHtml(r.value)}" ${r.value === "tech" ? "selected" : ""}>${escapeHtml(r.label)}</option>`,
+						).join("")}
           </select>
         </div>
         <div>
@@ -385,13 +392,13 @@ app.post("/users", async (c) => {
 	const email = String(form.email || "")
 		.trim()
 		.toLowerCase();
-	const role = String(form.role || "") as AppUser["role"];
+	const role = String(form.role || "");
 	const tempPassword = String(form.temp_password || "");
 	if (!name || !email || tempPassword.length < 8) {
 		return c.text("Name, email, and password (8+ chars) required", 400);
 	}
-	if (!["owner", "dispatcher", "tech"].includes(role)) {
-		return c.text("Invalid role", 400);
+	if (!isValidUserRole(role)) {
+		return c.text("Invalid designation", 400);
 	}
 	const existing = await c.env.DB.prepare(
 		`SELECT id FROM users WHERE email = ?`,
@@ -753,8 +760,8 @@ app.get("/jobs", async (c) => {
 			}>();
 
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name FROM users ORDER BY name COLLATE NOCASE`,
-	).all<{ id: string; name: string }>();
+		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string; role: string }>();
 
 	const rows =
 		jobs.results
@@ -802,7 +809,7 @@ app.get("/jobs", async (c) => {
 		staff.results
 			?.map(
 				(u) =>
-					`<option value="${escapeHtml(u.id)}" ${tech === u.id ? "selected" : ""}>${escapeHtml(u.name)}</option>`,
+					`<option value="${escapeHtml(u.id)}" ${tech === u.id ? "selected" : ""}>${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
 			)
 			.join("") || "";
 
@@ -981,7 +988,7 @@ app.get("/jobs/new", async (c) => {
 		staff.results
 			?.map(
 				(u) =>
-					`<option value="${escapeHtml(u.id)}" ${u.id === c.get("user").id ? "selected" : ""}>${escapeHtml(u.name)} (${escapeHtml(u.role)})</option>`,
+					`<option value="${escapeHtml(u.id)}" ${u.id === c.get("user").id ? "selected" : ""}>${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
 			)
 			.join("") || "";
 
@@ -1201,7 +1208,7 @@ app.get("/jobs/:id", async (c) => {
 	const job = await c.env.DB.prepare(
 		`SELECT j.*, c.name AS customer_name,
       s.address_line1, s.city, s.state, s.postal_code,
-      a.name AS assignee_name
+      a.name AS assignee_name, a.role AS assignee_role
      FROM jobs j
      JOIN customers c ON c.id = j.customer_id
      LEFT JOIN sites s ON s.id = j.site_id
@@ -1226,6 +1233,7 @@ app.get("/jobs/:id", async (c) => {
 			customer_name: string;
 			assigned_user_id: string | null;
 			assignee_name: string | null;
+			assignee_role: string | null;
 			address_line1: string | null;
 			city: string | null;
 			state: string | null;
@@ -1429,7 +1437,7 @@ app.get("/jobs/:id", async (c) => {
 		staff.results
 			?.map(
 				(u) =>
-					`<option value="${escapeHtml(u.id)}" ${job.assigned_user_id === u.id ? "selected" : ""}>${escapeHtml(u.name)} (${escapeHtml(u.role)})</option>`,
+					`<option value="${escapeHtml(u.id)}" ${job.assigned_user_id === u.id ? "selected" : ""}>${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
 			)
 			.join("") || "";
 
@@ -1452,7 +1460,16 @@ app.get("/jobs/:id", async (c) => {
         <div><span class="muted">Site</span><br>
           ${job.address_line1 ? `${escapeHtml(job.address_line1)}, ${escapeHtml(job.city)}, ${escapeHtml(job.state)} ${escapeHtml(job.postal_code)}` : "—"}
         </div>
-        <div><span class="muted">Assigned</span><br>${escapeHtml(job.assignee_name) || "Unassigned"}</div>
+        <div><span class="muted">Assigned</span><br>${
+					job.assignee_name
+						? escapeHtml(
+								assigneeOptionLabel(
+									job.assignee_name,
+									job.assignee_role || "tech",
+								),
+							)
+						: "Unassigned"
+				}</div>
         <div><span class="muted">Schedule</span><br>
           ${escapeHtml(job.scheduled_start ? job.scheduled_start.slice(0, 16).replace("T", " ") : "Not scheduled")}
           ${job.scheduled_end ? ` → ${escapeHtml(job.scheduled_end.slice(0, 16).replace("T", " "))}` : ""}
@@ -2171,8 +2188,8 @@ app.get("/recurring", async (c) => {
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name FROM users ORDER BY name COLLATE NOCASE`,
-	).all<{ id: string; name: string }>();
+		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string; role: string }>();
 
 	const rows =
 		list.results
@@ -2205,7 +2222,7 @@ app.get("/recurring", async (c) => {
 		staff.results
 			?.map(
 				(u) =>
-					`<option value="${escapeHtml(u.id)}">${escapeHtml(u.name)}</option>`,
+					`<option value="${escapeHtml(u.id)}">${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
 			)
 			.join("") || "";
 
@@ -2478,8 +2495,8 @@ app.get("/print/new", async (c) => {
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name FROM users ORDER BY name COLLATE NOCASE`,
-	).all<{ id: string; name: string }>();
+		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string; role: string }>();
 
 	const customerOptions =
 		customers.results
@@ -2492,7 +2509,7 @@ app.get("/print/new", async (c) => {
 		staff.results
 			?.map(
 				(u) =>
-					`<option value="${escapeHtml(u.id)}">${escapeHtml(u.name)}</option>`,
+					`<option value="${escapeHtml(u.id)}">${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
 			)
 			.join("") || "";
 	const productOptions = printTypesForSelect().map(
@@ -2581,7 +2598,7 @@ app.post("/print", async (c) => {
 app.get("/print/:id", async (c) => {
 	const id = c.req.param("id");
 	const job = await c.env.DB.prepare(
-		`SELECT p.*, c.name AS customer_name, u.name AS assignee_name
+		`SELECT p.*, c.name AS customer_name, u.name AS assignee_name, u.role AS assignee_role
      FROM print_jobs p
      LEFT JOIN customers c ON c.id = p.customer_id
      LEFT JOIN users u ON u.id = p.assigned_user_id
@@ -2606,12 +2623,13 @@ app.get("/print/:id", async (c) => {
 			customer_name: string | null;
 			assigned_user_id: string | null;
 			assignee_name: string | null;
+			assignee_role: string | null;
 		}>();
 	if (!job) return c.notFound();
 
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name FROM users ORDER BY name COLLATE NOCASE`,
-	).all<{ id: string; name: string }>();
+		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string; role: string }>();
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
@@ -2645,7 +2663,7 @@ app.get("/print/:id", async (c) => {
 		staff.results
 			?.map(
 				(u) =>
-					`<option value="${escapeHtml(u.id)}" ${job.assigned_user_id === u.id ? "selected" : ""}>${escapeHtml(u.name)}</option>`,
+					`<option value="${escapeHtml(u.id)}" ${job.assigned_user_id === u.id ? "selected" : ""}>${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
 			)
 			.join("") || "";
 	const customerOptions =
@@ -2739,7 +2757,16 @@ app.get("/print/:id", async (c) => {
     <div class="row" style="margin-top:1rem">
       <div class="panel stack">
         <div><span class="muted">Customer</span><br>${escapeHtml(job.customer_name) || "—"}</div>
-        <div><span class="muted">Assigned</span><br>${escapeHtml(job.assignee_name) || "Unassigned"}</div>
+        <div><span class="muted">Assigned</span><br>${
+					job.assignee_name
+						? escapeHtml(
+								assigneeOptionLabel(
+									job.assignee_name,
+									job.assignee_role || "tech",
+								),
+							)
+						: "Unassigned"
+				}</div>
         <div><span class="muted">Quantity</span><br>${job.quantity ?? "—"}</div>
         <div><span class="muted">Due</span><br>${escapeHtml(job.due_date) || "—"}</div>
         <div><span class="muted">Quote total</span><br>${escapeHtml(money(job.estimate_cents))}</div>
