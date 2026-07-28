@@ -63,6 +63,18 @@ import {
 	type AssetRow,
 } from "./lib/inventory";
 
+import {
+	PORTAL_COOKIE,
+	clearPortalCookie,
+	createPortalSession,
+	destroyPortalSession,
+	getPortalCustomer,
+	mintPortalToken,
+	revokePortalToken,
+	setPortalCookie,
+	type PortalCustomer,
+} from "./lib/portal";
+
 const RESTORATION_SQL_TYPES = [
 	...RESTORATION_TYPES.map((t) => t.value),
 	"restoration",
@@ -75,7 +87,8 @@ export type Env = {
 };
 
 type Variables = {
-	user: AppUser;
+	user?: AppUser;
+	portalCustomer: PortalCustomer | null;
 	flash: string | null;
 };
 
@@ -84,6 +97,7 @@ const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 app.use("*", async (c, next) => {
 	await ensureSeedUser(c.env.DB);
 	c.set("flash", null);
+	c.set("portalCustomer", null);
 	await next();
 });
 
@@ -101,14 +115,41 @@ function page(
 	});
 }
 
-/** Auth gate for app pages (not login/static). */
+function portalPage(title: string, customer: PortalCustomer, body: string) {
+	return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)} · Customer portal</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><a href="/portal">Timla job portal</a></div>
+    <div class="userbar">
+      <span>${escapeHtml(customer.name)}</span>
+      <form method="post" action="/portal/logout" class="inline">
+        <button type="submit" class="linkish">Sign out</button>
+      </form>
+    </div>
+  </header>
+  <main class="main">${body}</main>
+  <footer class="foot"><span>Read-only customer view</span></footer>
+</body>
+</html>`;
+}
+
+/** Auth gate for app pages (not login/static/portal). */
 app.use("*", async (c, next) => {
 	const path = new URL(c.req.url).pathname;
 	if (
 		path === "/login" ||
 		path === "/logout" ||
 		path === "/styles.css" ||
-		path === "/health"
+		path === "/health" ||
+		path === "/portal" ||
+		path.startsWith("/portal/")
 	) {
 		return next();
 	}
@@ -124,7 +165,257 @@ app.use("*", async (c, next) => {
 	return next();
 });
 
+/** Portal session gate for /portal except enter/logout. */
+app.use("/portal/*", async (c, next) => {
+	const path = new URL(c.req.url).pathname;
+	if (
+		path === "/portal/enter" ||
+		path === "/portal/logout" ||
+		path === "/portal"
+	) {
+		// /portal itself handled in route (may redirect)
+		return next();
+	}
+	const customer = await getPortalCustomer(
+		c.env.DB,
+		getCookie(c, PORTAL_COOKIE),
+	);
+	if (!customer) {
+		return c.redirect("/portal/enter");
+	}
+	c.set("portalCustomer", customer);
+	return next();
+});
+
 app.get("/health", (c) => c.json({ ok: true, app: "lumanyi" }));
+
+app.get("/portal", async (c) => {
+	const customer = await getPortalCustomer(
+		c.env.DB,
+		getCookie(c, PORTAL_COOKIE),
+	);
+	if (!customer) return c.redirect("/portal/enter");
+	return c.redirect("/portal/jobs");
+});
+
+app.get("/portal/enter", async (c) => {
+	const existing = await getPortalCustomer(
+		c.env.DB,
+		getCookie(c, PORTAL_COOKIE),
+	);
+	if (existing) return c.redirect("/portal/jobs");
+	const prefill = c.req.query("t") || "";
+	const body = `
+    <div class="login-wrap">
+      <div class="panel stack">
+        <h1>Customer portal</h1>
+        <p class="muted">Enter the access link code Timla sent you. Read-only job status view.</p>
+        <form method="post" action="/portal/enter" class="stack">
+          <div>
+            <label for="token">Access code</label>
+            <input id="token" name="token" type="text" required autocomplete="off" value="${escapeHtml(prefill)}" />
+          </div>
+          <button class="btn" type="submit">Open my jobs</button>
+        </form>
+      </div>
+    </div>`;
+	return c.html(
+		layout({ title: "Customer portal", body, user: null }),
+	);
+});
+
+app.post("/portal/enter", async (c) => {
+	const form = await c.req.parseBody();
+	const raw = String(form.token || "").trim();
+	const session = await createPortalSession(c.env.DB, raw);
+	if (!session) {
+		const body = `
+      <div class="login-wrap">
+        <div class="panel stack">
+          <h1>Customer portal</h1>
+          <div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">Invalid or expired access code.</div>
+          <form method="post" action="/portal/enter" class="stack">
+            <div>
+              <label for="token">Access code</label>
+              <input id="token" name="token" type="text" required autocomplete="off" />
+            </div>
+            <button class="btn" type="submit">Open my jobs</button>
+          </form>
+        </div>
+      </div>`;
+		return c.html(layout({ title: "Customer portal", body, user: null }), 400);
+	}
+	setPortalCookie(c, session.sessionId);
+	return c.redirect("/portal/jobs");
+});
+
+app.post("/portal/logout", async (c) => {
+	await destroyPortalSession(c.env.DB, getCookie(c, PORTAL_COOKIE));
+	clearPortalCookie(c);
+	return c.redirect("/portal/enter");
+});
+
+app.get("/portal/jobs", async (c) => {
+	const customer =
+		c.get("portalCustomer") ||
+		(await getPortalCustomer(c.env.DB, getCookie(c, PORTAL_COOKIE)));
+	if (!customer) return c.redirect("/portal/enter");
+
+	const jobs = await c.env.DB.prepare(
+		`SELECT id, title, job_type, status, scheduled_start, claim_number
+     FROM jobs WHERE customer_id = ? AND status != 'cancelled'
+     ORDER BY COALESCE(scheduled_start, created_at) DESC LIMIT 50`,
+	)
+		.bind(customer.id)
+		.all<{
+			id: string;
+			title: string;
+			job_type: string;
+			status: string;
+			scheduled_start: string | null;
+			claim_number: string | null;
+		}>();
+
+	const rows =
+		jobs.results
+			?.map(
+				(j) => `<tr>
+        <td><a href="/portal/jobs/${escapeHtml(j.id)}">${escapeHtml(j.title)}</a></td>
+        <td>${escapeHtml(jobTypeLabel(j.job_type))}</td>
+        <td><span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span></td>
+        <td>${escapeHtml(j.scheduled_start ? j.scheduled_start.slice(0, 16).replace("T", " ") : "—")}</td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="4" class="muted">No jobs to show.</td></tr>`;
+
+	const body = `
+    <h1>Your jobs</h1>
+    <p class="muted">Hello ${escapeHtml(customer.name)} — status and schedule only.</p>
+    <table>
+      <thead><tr><th>Job</th><th>Type</th><th>Status</th><th>When</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+	return c.html(portalPage("Your jobs", customer, body));
+});
+
+app.get("/portal/jobs/:id", async (c) => {
+	const customer =
+		c.get("portalCustomer") ||
+		(await getPortalCustomer(c.env.DB, getCookie(c, PORTAL_COOKIE)));
+	if (!customer) return c.redirect("/portal/enter");
+
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, j.scheduled_end,
+      j.claim_number, j.carrier, j.date_of_loss, j.notes,
+      s.address_line1, s.city, s.state, s.postal_code
+     FROM jobs j
+     LEFT JOIN sites s ON s.id = j.site_id
+     WHERE j.id = ? AND j.customer_id = ?`,
+	)
+		.bind(id, customer.id)
+		.first<{
+			id: string;
+			title: string;
+			job_type: string;
+			status: string;
+			scheduled_start: string | null;
+			scheduled_end: string | null;
+			claim_number: string | null;
+			carrier: string | null;
+			date_of_loss: string | null;
+			notes: string | null;
+			address_line1: string | null;
+			city: string | null;
+			state: string | null;
+			postal_code: string | null;
+		}>();
+	if (!job) return c.notFound();
+
+	const notes = await c.env.DB.prepare(
+		`SELECT body, created_at FROM job_notes WHERE job_id = ? ORDER BY created_at DESC LIMIT 10`,
+	)
+		.bind(id)
+		.all<{ body: string; created_at: string }>();
+
+	const moisture = isRestorationType(job.job_type)
+		? await c.env.DB.prepare(
+				`SELECT logged_at, area, reading, notes FROM job_field_logs
+         WHERE job_id = ? AND kind = 'moisture'
+         ORDER BY logged_at DESC LIMIT 20`,
+			)
+				.bind(id)
+				.all<{
+					logged_at: string;
+					area: string | null;
+					reading: string | null;
+					notes: string | null;
+				}>()
+		: { results: [] as Array<{
+				logged_at: string;
+				area: string | null;
+				reading: string | null;
+				notes: string | null;
+			}> };
+
+	const noteItems =
+		notes.results
+			?.map(
+				(n) => `<div class="panel" style="padding:0.75rem">
+        <div class="muted" style="font-size:0.8rem">${escapeHtml(n.created_at.slice(0, 16).replace("T", " "))}</div>
+        <div>${escapeHtml(n.body)}</div>
+      </div>`,
+			)
+			.join("") || `<p class="muted">No field notes shared.</p>`;
+
+	const moistureRows =
+		moisture.results
+			?.map(
+				(m) => `<tr>
+        <td>${escapeHtml(m.logged_at.slice(0, 10))}</td>
+        <td>${escapeHtml(m.area) || "—"}</td>
+        <td>${escapeHtml(m.reading) || "—"}</td>
+        <td>${escapeHtml(m.notes) || "—"}</td>
+      </tr>`,
+			)
+			.join("") || "";
+
+	const moistureSection =
+		isRestorationType(job.job_type) && moistureRows
+			? `<h2>Moisture readings</h2>
+    <table>
+      <thead><tr><th>Date</th><th>Area</th><th>Reading</th><th>Notes</th></tr></thead>
+      <tbody>${moistureRows}</tbody>
+    </table>`
+			: isRestorationType(job.job_type)
+				? `<h2>Moisture readings</h2><p class="muted">No readings logged yet.</p>`
+				: "";
+
+	const body = `
+    <p><a href="/portal/jobs">← All jobs</a></p>
+    <h1>${escapeHtml(job.title)}</h1>
+    <p class="muted">${escapeHtml(jobTypeLabel(job.job_type))} ·
+      <span class="badge ${escapeHtml(job.status)}">${escapeHtml(statusLabel(job.status))}</span></p>
+    <div class="panel stack">
+      <div><span class="muted">Site</span><br>
+        ${job.address_line1 ? `${escapeHtml(job.address_line1)}, ${escapeHtml(job.city)}, ${escapeHtml(job.state)} ${escapeHtml(job.postal_code)}` : "—"}
+      </div>
+      <div><span class="muted">Schedule</span><br>
+        ${escapeHtml(job.scheduled_start ? job.scheduled_start.slice(0, 16).replace("T", " ") : "Not scheduled")}
+        ${job.scheduled_end ? ` → ${escapeHtml(job.scheduled_end.slice(0, 16).replace("T", " "))}` : ""}
+      </div>
+      ${job.claim_number ? `<div><span class="muted">Claim #</span><br>${escapeHtml(job.claim_number)}</div>` : ""}
+      ${job.carrier ? `<div><span class="muted">Carrier</span><br>${escapeHtml(job.carrier)}</div>` : ""}
+      ${job.date_of_loss ? `<div><span class="muted">Date of loss</span><br>${escapeHtml(job.date_of_loss)}</div>` : ""}
+      ${job.notes ? `<div><span class="muted">Job notes</span><br>${escapeHtml(job.notes)}</div>` : ""}
+    </div>
+    ${moistureSection}
+    <h2>Recent notes</h2>
+    <div class="stack">${noteItems}</div>`;
+
+	return c.html(portalPage(job.title, customer, body));
+});
 
 app.get("/login", async (c) => {
 	const user = await getSessionUser(c.env.DB, getCookie(c, SESSION_COOKIE));
@@ -223,7 +514,7 @@ app.post("/logout", async (c) => {
 });
 
 app.get("/account/password", (c) => {
-	const user = c.get("user");
+	const user = c.get("user")!;
 	const forced = user.mustChangePassword;
 	const body = `
     <div class="login-wrap">
@@ -251,7 +542,7 @@ app.get("/account/password", (c) => {
 });
 
 app.post("/account/password", async (c) => {
-	const user = c.get("user");
+	const user = c.get("user")!;
 	const form = await c.req.parseBody();
 	const newPassword = String(form.new_password || "");
 	const confirm = String(form.confirm_password || "");
@@ -328,7 +619,7 @@ app.post("/account/password", async (c) => {
 });
 
 app.get("/users", async (c) => {
-	if (c.get("user").role !== "owner") {
+	if (c.get("user")!.role !== "owner") {
 		return c.html(
 			page(c, "Users", `<h1>Users</h1><p class="muted">Owner access only.</p>`),
 			403,
@@ -397,7 +688,7 @@ app.get("/users", async (c) => {
 });
 
 app.post("/users", async (c) => {
-	if (c.get("user").role !== "owner") return c.text("Forbidden", 403);
+	if (c.get("user")!.role !== "owner") return c.text("Forbidden", 403);
 	const form = await c.req.parseBody();
 	const name = String(form.name || "").trim();
 	const email = String(form.email || "")
@@ -666,6 +957,21 @@ app.get("/customers/:id", async (c) => {
 			scheduled_start: string | null;
 		}>();
 
+	const tokens = await c.env.DB.prepare(
+		`SELECT id, label, expires_at, created_at, revoked_at, last_used_at
+     FROM portal_tokens WHERE customer_id = ?
+     ORDER BY created_at DESC LIMIT 10`,
+	)
+		.bind(id)
+		.all<{
+			id: string;
+			label: string | null;
+			expires_at: string;
+			created_at: string;
+			revoked_at: string | null;
+			last_used_at: string | null;
+		}>();
+
 	const siteRows =
 		sites.results
 			?.map(
@@ -684,12 +990,46 @@ app.get("/customers/:id", async (c) => {
 			)
 			.join("") || `<tr><td colspan="3" class="muted">No jobs yet.</td></tr>`;
 
+	const tokenRows =
+		tokens.results
+			?.map((t) => {
+				const status = t.revoked_at
+					? "Revoked"
+					: new Date(t.expires_at) < new Date()
+						? "Expired"
+						: "Active";
+				return `<tr>
+        <td>${escapeHtml(t.label) || "—"}</td>
+        <td>${escapeHtml(status)}</td>
+        <td>${escapeHtml(t.expires_at.slice(0, 10))}</td>
+        <td>${t.last_used_at ? escapeHtml(t.last_used_at.slice(0, 16).replace("T", " ")) : "—"}</td>
+        <td>${
+					!t.revoked_at && new Date(t.expires_at) >= new Date()
+						? `<form method="post" action="/customers/${escapeHtml(id)}/portal/${escapeHtml(t.id)}/revoke" class="inline" onsubmit="return confirm('Revoke this portal link?');">
+            <button class="linkish" type="submit">Revoke</button>
+          </form>`
+						: ""
+				}</td>
+      </tr>`;
+			})
+			.join("") || `<tr><td colspan="5" class="muted">No portal links yet.</td></tr>`;
+
+	const minted = c.req.query("minted") || "";
+	const mintedFlash = minted
+		? `<div class="flash">
+        Portal link created. Copy now — it won’t be shown again.<br>
+        <code style="word-break:break-all">/portal/enter?t=${escapeHtml(minted)}</code><br>
+        Or code: <code style="word-break:break-all">${escapeHtml(minted)}</code>
+      </div>`
+		: "";
+
 	const body = `
     <div class="toolbar">
       <div class="grow"><h1 style="margin:0">${escapeHtml(customer.name)}</h1></div>
       <a class="btn" href="/jobs/new?product=restoration&customer_id=${escapeHtml(customer.id)}">New restoration</a>
       <a class="btn secondary" href="/jobs/new?product=floors&customer_id=${escapeHtml(customer.id)}">New floor job</a>
     </div>
+    ${mintedFlash}
     <div class="panel stack">
       <div><span class="muted">Phone</span><br>${escapeHtml(customer.phone) || "—"}</div>
       <div><span class="muted">Email</span><br>${escapeHtml(customer.email) || "—"}</div>
@@ -700,9 +1040,49 @@ app.get("/customers/:id", async (c) => {
     <table>
       <thead><tr><th>Job</th><th>Type</th><th>Status</th></tr></thead>
       <tbody>${jobRows}</tbody>
+    </table>
+    <h2>Customer portal</h2>
+    <p class="muted">Read-only magic link — customer sees job status, schedule, notes, and moisture summary.</p>
+    <form method="post" action="/customers/${escapeHtml(id)}/portal" class="panel toolbar" style="align-items:end">
+      <div class="grow">
+        <label for="label">Label (optional)</label>
+        <input id="label" name="label" placeholder="Homeowner text link" />
+      </div>
+      <button class="btn" type="submit">Create portal link</button>
+    </form>
+    <table>
+      <thead><tr><th>Label</th><th>Status</th><th>Expires</th><th>Last used</th><th></th></tr></thead>
+      <tbody>${tokenRows}</tbody>
     </table>`;
 
 	return c.html(page(c, customer.name, body));
+});
+
+app.post("/customers/:id/portal", async (c) => {
+	const id = c.req.param("id");
+	const customer = await c.env.DB.prepare(
+		`SELECT id FROM customers WHERE id = ?`,
+	)
+		.bind(id)
+		.first();
+	if (!customer) return c.notFound();
+	const form = await c.req.parseBody();
+	const minted = await mintPortalToken(
+		c.env.DB,
+		id,
+		c.get("user")!.id ?? null,
+		String(form.label || ""),
+	);
+	return c.redirect(
+		`/customers/${id}?minted=${encodeURIComponent(minted.rawToken)}`,
+	);
+});
+
+app.post("/customers/:id/portal/:tokenId/revoke", async (c) => {
+	const id = c.req.param("id");
+	const tokenId = c.req.param("tokenId");
+	await revokePortalToken(c.env.DB, tokenId, id);
+	return c.redirect(`/customers/${id}`);
 });
 
 app.get("/jobs", async (c) => {
@@ -1000,7 +1380,7 @@ app.get("/jobs/new", async (c) => {
 		staff.results
 			?.map(
 				(u) =>
-					`<option value="${escapeHtml(u.id)}" ${u.id === c.get("user").id ? "selected" : ""}>${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
+					`<option value="${escapeHtml(u.id)}" ${u.id === c.get("user")!.id ? "selected" : ""}>${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
 			)
 			.join("") || "";
 
@@ -1718,7 +2098,7 @@ app.post("/jobs/:id/logs/moisture", async (c) => {
 			area,
 			reading,
 			String(form.notes || "").trim() || null,
-			c.get("user").id,
+			c.get("user")!.id,
 		)
 		.run();
 	await c.env.DB.prepare(
@@ -1760,7 +2140,7 @@ app.post("/jobs/:id/logs/equipment", async (c) => {
 			equipmentType,
 			count,
 			String(form.notes || "").trim() || null,
-			c.get("user").id,
+			c.get("user")!.id,
 		)
 		.run();
 	await c.env.DB.prepare(
@@ -2156,7 +2536,7 @@ app.post("/jobs/:id/notes", async (c) => {
 	await c.env.DB.prepare(
 		`INSERT INTO job_notes (id, job_id, user_id, body) VALUES (?, ?, ?, ?)`,
 	)
-		.bind(newId("note"), id, c.get("user").id, body)
+		.bind(newId("note"), id, c.get("user")!.id, body)
 		.run();
 	return c.redirect(`/jobs/${id}`);
 });
@@ -2201,7 +2581,7 @@ app.post("/jobs/:id/photos", async (c) => {
 			safeName,
 			file.type || null,
 			file.size,
-			c.get("user").id,
+			c.get("user")!.id,
 		)
 		.run();
 	await c.env.DB.prepare(
@@ -3674,7 +4054,7 @@ app.post("/print/:id/files", async (c) => {
 			safeName,
 			file.type || null,
 			file.size,
-			c.get("user").id,
+			c.get("user")!.id,
 		)
 		.run();
 	await c.env.DB.prepare(
@@ -3767,7 +4147,7 @@ app.post("/print/:id/quote/:lineId/delete", async (c) => {
 });
 
 app.get("/tech", async (c) => {
-	const user = c.get("user");
+	const user = c.get("user")!;
 	const jobs = await c.env.DB.prepare(
 		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name,
       s.address_line1, s.city
