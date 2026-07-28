@@ -126,6 +126,12 @@ import {
 	canAccessTrash,
 	canSoftDelete,
 } from "./lib/soft-delete";
+import {
+	canSetAssetStatusWithOpenAssignment,
+	canVoidClaimData,
+	normalizeVoidReason,
+	NOT_VOIDED_SQL,
+} from "./lib/void-data";
 
 const RESTORATION_SQL_TYPES = [
 	...RESTORATION_TYPES.map((t) => t.value),
@@ -178,6 +184,16 @@ function forbiddenHtml(
 		"Forbidden",
 		`<h1>Forbidden</h1><p class="muted">${escapeHtml(message)}</p>`,
 	);
+}
+
+/** SA-3: Void / Incorrect form — reason required; row stays. */
+function voidActionForm(action: string, buttonLabel = "Void"): string {
+	return `<form method="post" action="${action}" class="stack" style="gap:0.35rem;margin-top:0.35rem"
+    onsubmit="return confirm('Mark as void / incorrect? The row stays for claim history.');">
+    <input name="void_reason" required minlength="3" maxlength="500" placeholder="Reason (required)"
+      style="max-width:14rem;font-size:0.85rem" />
+    <button class="linkish" type="submit">${escapeHtml(buttonLabel)}</button>
+  </form>`;
 }
 
 async function loadFieldJobAccess(
@@ -525,7 +541,7 @@ app.get("/portal/jobs/:id", async (c) => {
 	const moisture = isRestorationType(job.job_type)
 		? await c.env.DB.prepare(
 				`SELECT logged_at, area, reading, temp_f, rh_pct, grains, notes FROM job_field_logs
-         WHERE job_id = ? AND kind = 'moisture'
+         WHERE job_id = ? AND kind = 'moisture' AND ${NOT_VOIDED_SQL}
          ORDER BY logged_at DESC LIMIT 20`,
 			)
 				.bind(id)
@@ -2943,7 +2959,7 @@ app.get("/jobs/:id", async (c) => {
 		.all<{ body: string; created_at: string; user_name: string | null }>();
 
 	const photos = await c.env.DB.prepare(
-		`SELECT id, filename, content_type, created_at FROM job_photos
+		`SELECT id, filename, content_type, created_at, voided_at, void_reason FROM job_photos
      WHERE job_id = ? ORDER BY created_at DESC`,
 	)
 		.bind(id)
@@ -2952,6 +2968,8 @@ app.get("/jobs/:id", async (c) => {
 			filename: string;
 			content_type: string | null;
 			created_at: string;
+			voided_at: string | null;
+			void_reason: string | null;
 		}>();
 
 	const checkItems =
@@ -2979,19 +2997,27 @@ app.get("/jobs/:id", async (c) => {
 
 	const photoItems =
 		photos.results
-			?.map(
-				(p) => `<div class="panel" style="padding:0.75rem">
+			?.map((p) => {
+				const voided = !!p.voided_at;
+				const voidBadge = voided
+					? `<div style="color:#92400e;font-size:0.8rem;margin:0.35rem 0">VOIDED · ${escapeHtml(p.void_reason) || "incorrect"} · ${escapeHtml(p.voided_at!.slice(0, 16).replace("T", " "))}</div>`
+					: "";
+				const voidBtn =
+					!voided && canWrite && canVoidClaimData(user)
+						? voidActionForm(
+								`/jobs/${escapeHtml(id)}/photos/${escapeHtml(p.id)}/void`,
+							)
+						: "";
+				return `<div class="panel" style="padding:0.75rem${voided ? ";opacity:0.65" : ""}">
         <a href="/jobs/${escapeHtml(id)}/photos/${escapeHtml(p.id)}" target="_blank" rel="noopener">
           <img src="/jobs/${escapeHtml(id)}/photos/${escapeHtml(p.id)}" alt="${escapeHtml(p.filename)}"
-            style="max-width:100%;max-height:220px;border-radius:8px;display:block;margin-bottom:0.5rem" />
+            style="max-width:100%;max-height:220px;border-radius:8px;display:block;margin-bottom:0.5rem${voided ? ";filter:grayscale(0.6)" : ""}" />
         </a>
         <div class="muted" style="font-size:0.8rem">${escapeHtml(p.filename)} · ${escapeHtml(p.created_at.slice(0, 16).replace("T", " "))}</div>
-        <form method="post" action="/jobs/${escapeHtml(id)}/photos/${escapeHtml(p.id)}/delete" class="inline"
-          onsubmit="return confirm('Delete this photo?');">
-          <button class="linkish" type="submit">Delete</button>
-        </form>
-      </div>`,
-			)
+        ${voidBadge}
+        ${voidBtn}
+      </div>`;
+			})
 			.join("") || `<p class="muted">No photos yet.</p>`;
 
 	const isRestoration = isRestorationType(job.job_type);
@@ -2999,7 +3025,8 @@ app.get("/jobs/:id", async (c) => {
 	if (isRestoration) {
 		const logs = await c.env.DB.prepare(
 			`SELECT l.id, l.kind, l.logged_at, l.area, l.reading, l.temp_f, l.rh_pct, l.grains,
-        l.equipment_type, l.equipment_count, l.notes, l.created_at, u.name AS user_name
+        l.equipment_type, l.equipment_count, l.notes, l.created_at, l.voided_at, l.void_reason,
+        u.name AS user_name
        FROM job_field_logs l
        LEFT JOIN users u ON u.id = l.created_by
        WHERE l.job_id = ?
@@ -3025,26 +3052,29 @@ app.get("/jobs/:id", async (c) => {
 					]
 						.filter(Boolean)
 						.join(" · ");
-					return `<tr>
+					const voided = !!l.voided_at;
+					const actionCell = voided
+						? `<span style="color:#92400e;font-size:0.8rem">VOIDED · ${escapeHtml(l.void_reason) || "incorrect"}</span>`
+						: canWrite && canVoidClaimData(user)
+							? voidActionForm(
+									`/jobs/${escapeHtml(id)}/logs/${escapeHtml(l.id)}/void`,
+								)
+							: "";
+					return `<tr${voided ? ' style="opacity:0.55;text-decoration:line-through"' : ""}>
             <td>${escapeHtml(l.logged_at.slice(0, 10))}</td>
             <td>${escapeHtml(l.area) || "—"}</td>
             <td>${escapeHtml(l.reading) || "—"}</td>
             <td>${escapeHtml(psycho) || "—"}</td>
             <td>${escapeHtml(l.notes) || "—"}</td>
             <td class="muted">${escapeHtml(l.user_name) || "—"}</td>
-            <td>
-              <form method="post" action="/jobs/${escapeHtml(id)}/logs/${escapeHtml(l.id)}/delete" class="inline"
-                onsubmit="return confirm('Delete this reading?');">
-                <button class="linkish" type="submit">Delete</button>
-              </form>
-            </td>
+            <td>${actionCell}</td>
           </tr>`;
 				})
 				.join("") ||
 			`<tr><td colspan="7" class="muted">No moisture readings yet.</td></tr>`;
 
 		const moistureMaps = await c.env.DB.prepare(
-			`SELECT id, filename, content_type, label, created_at FROM job_moisture_maps
+			`SELECT id, filename, content_type, label, created_at, voided_at, void_reason FROM job_moisture_maps
        WHERE job_id = ? ORDER BY created_at DESC`,
 		)
 			.bind(id)
@@ -3054,47 +3084,60 @@ app.get("/jobs/:id", async (c) => {
 				content_type: string | null;
 				label: string | null;
 				created_at: string;
+				voided_at: string | null;
+				void_reason: string | null;
 			}>();
 
 		const moistureMapItems =
 			moistureMaps.results
-				?.map(
-					(m) => `<div class="panel" style="padding:0.75rem">
+				?.map((m) => {
+					const voided = !!m.voided_at;
+					const voidBadge = voided
+						? `<div style="color:#92400e;font-size:0.8rem;margin:0.35rem 0">VOIDED · ${escapeHtml(m.void_reason) || "incorrect"} · ${escapeHtml(m.voided_at!.slice(0, 16).replace("T", " "))}</div>`
+						: "";
+					const voidBtn =
+						!voided && canWrite && canVoidClaimData(user)
+							? voidActionForm(
+									`/jobs/${escapeHtml(id)}/moisture-maps/${escapeHtml(m.id)}/void`,
+								)
+							: "";
+					return `<div class="panel" style="padding:0.75rem${voided ? ";opacity:0.65" : ""}">
         <a href="/jobs/${escapeHtml(id)}/moisture-maps/${escapeHtml(m.id)}" target="_blank" rel="noopener">
           <img src="/jobs/${escapeHtml(id)}/moisture-maps/${escapeHtml(m.id)}" alt="${escapeHtml(m.label || m.filename)}"
-            style="max-width:100%;max-height:280px;border-radius:8px;display:block;margin-bottom:0.5rem" />
+            style="max-width:100%;max-height:280px;border-radius:8px;display:block;margin-bottom:0.5rem${voided ? ";filter:grayscale(0.6)" : ""}" />
         </a>
         <div class="muted" style="font-size:0.8rem">
           ${m.label ? `${escapeHtml(m.label)} · ` : ""}${escapeHtml(m.filename)}
           · ${escapeHtml(m.created_at.slice(0, 16).replace("T", " "))}
         </div>
-        <form method="post" action="/jobs/${escapeHtml(id)}/moisture-maps/${escapeHtml(m.id)}/delete" class="inline"
-          onsubmit="return confirm('Delete this moisture map?');">
-          <button class="linkish" type="submit">Delete</button>
-        </form>
-      </div>`,
-				)
+        ${voidBadge}
+        ${voidBtn}
+      </div>`;
+				})
 				.join("") || `<p class="muted">No moisture maps yet.</p>`;
 
 		const equipmentRows =
 			logs.results
 				?.filter((l) => l.kind === "equipment")
-				.map(
-					(l) => `<tr>
+				.map((l) => {
+					const voided = !!l.voided_at;
+					const actionCell = voided
+						? `<span style="color:#92400e;font-size:0.8rem">VOIDED · ${escapeHtml(l.void_reason) || "incorrect"}</span>`
+						: canWrite && canVoidClaimData(user)
+							? voidActionForm(
+									`/jobs/${escapeHtml(id)}/logs/${escapeHtml(l.id)}/void`,
+								)
+							: "";
+					return `<tr${voided ? ' style="opacity:0.55;text-decoration:line-through"' : ""}>
             <td>${escapeHtml(l.logged_at.slice(0, 10))}</td>
             <td>${escapeHtml(l.area) || "—"}</td>
             <td>${escapeHtml(equipmentTypeLabel(l.equipment_type))}</td>
             <td>${l.equipment_count != null ? escapeHtml(l.equipment_count) : "—"}</td>
             <td>${escapeHtml(l.notes) || "—"}</td>
             <td class="muted">${escapeHtml(l.user_name) || "—"}</td>
-            <td>
-              <form method="post" action="/jobs/${escapeHtml(id)}/logs/${escapeHtml(l.id)}/delete" class="inline"
-                onsubmit="return confirm('Delete this equipment entry?');">
-                <button class="linkish" type="submit">Delete</button>
-              </form>
-            </td>
-          </tr>`,
-				)
+            <td>${actionCell}</td>
+          </tr>`;
+				})
 				.join("") ||
 			`<tr><td colspan="7" class="muted">No equipment logged yet.</td></tr>`;
 
@@ -3705,16 +3748,32 @@ app.post("/jobs/:id/logs/equipment", async (c) => {
 	return c.redirect(`/jobs/${id}`);
 });
 
-app.post("/jobs/:id/logs/:logId/delete", async (c) => {
+app.post("/jobs/:id/logs/:logId/void", async (c) => {
 	const id = c.req.param("id");
 	const logId = c.req.param("logId");
 	const gate = await requireRestorationJob(c.env.DB, id);
 	if (gate instanceof Response) return gate;
 
-	await c.env.DB.prepare(
-		`DELETE FROM job_field_logs WHERE id = ? AND job_id = ?`,
+	const user = c.get("user")!;
+	if (!canVoidClaimData(user)) return c.text("Forbidden", 403);
+
+	const form = await c.req.parseBody();
+	const reason = normalizeVoidReason(form.void_reason);
+	if (!reason) return c.text("Void reason required (at least 3 characters)", 400);
+
+	const result = await c.env.DB.prepare(
+		`UPDATE job_field_logs
+     SET voided_at = datetime('now'), voided_by = ?, void_reason = ?
+     WHERE id = ? AND job_id = ? AND voided_at IS NULL`,
 	)
-		.bind(logId, id)
+		.bind(user.id, reason, logId, id)
+		.run();
+	if (!result.meta.changes) return c.text("Log not found or already voided", 404);
+
+	await c.env.DB.prepare(
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
 		.run();
 	return c.redirect(`/jobs/${id}`);
 });
@@ -4098,7 +4157,7 @@ app.get("/jobs/:id/water-loss.pdf", async (c) => {
 	const logs = await c.env.DB.prepare(
 		`SELECT kind, logged_at, area, reading, temp_f, rh_pct, grains,
       equipment_type, equipment_count, notes
-     FROM job_field_logs WHERE job_id = ?
+     FROM job_field_logs WHERE job_id = ? AND ${NOT_VOIDED_SQL}
      ORDER BY logged_at ASC, created_at ASC`,
 	)
 		.bind(id)
@@ -4124,7 +4183,8 @@ app.get("/jobs/:id/water-loss.pdf", async (c) => {
 		.all<{ body: string; created_at: string; user_name: string | null }>();
 
 	const moistureMaps = await c.env.DB.prepare(
-		`SELECT filename, label FROM job_moisture_maps WHERE job_id = ? ORDER BY created_at ASC`,
+		`SELECT filename, label FROM job_moisture_maps
+     WHERE job_id = ? AND ${NOT_VOIDED_SQL} ORDER BY created_at ASC`,
 	)
 		.bind(id)
 		.all<{ filename: string; label: string | null }>();
@@ -4282,20 +4342,29 @@ app.get("/jobs/:id/photos/:photoId", async (c) => {
 	return new Response(obj.body, { headers });
 });
 
-app.post("/jobs/:id/photos/:photoId/delete", async (c) => {
+app.post("/jobs/:id/photos/:photoId/void", async (c) => {
 	const id = c.req.param("id");
 	const photoId = c.req.param("photoId");
-	const row = await c.env.DB.prepare(
-		`SELECT r2_key FROM job_photos WHERE id = ? AND job_id = ?`,
+	const user = c.get("user")!;
+	if (!canVoidClaimData(user)) return c.text("Forbidden", 403);
+
+	const form = await c.req.parseBody();
+	const reason = normalizeVoidReason(form.void_reason);
+	if (!reason) return c.text("Void reason required (at least 3 characters)", 400);
+
+	const result = await c.env.DB.prepare(
+		`UPDATE job_photos
+     SET voided_at = datetime('now'), voided_by = ?, void_reason = ?
+     WHERE id = ? AND job_id = ? AND voided_at IS NULL`,
 	)
-		.bind(photoId, id)
-		.first<{ r2_key: string }>();
-	if (!row) return c.notFound();
-	await c.env.UPLOADS.delete(row.r2_key);
+		.bind(user.id, reason, photoId, id)
+		.run();
+	if (!result.meta.changes) return c.text("Photo not found or already voided", 404);
+
 	await c.env.DB.prepare(
-		`DELETE FROM job_photos WHERE id = ? AND job_id = ?`,
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
 	)
-		.bind(photoId, id)
+		.bind(id)
 		.run();
 	return c.redirect(`/jobs/${id}`);
 });
@@ -4373,23 +4442,32 @@ app.get("/jobs/:id/moisture-maps/:mapId", async (c) => {
 	return new Response(obj.body, { headers });
 });
 
-app.post("/jobs/:id/moisture-maps/:mapId/delete", async (c) => {
+app.post("/jobs/:id/moisture-maps/:mapId/void", async (c) => {
 	const id = c.req.param("id");
 	const mapId = c.req.param("mapId");
 	const gate = await requireRestorationJob(c.env.DB, id);
 	if (gate instanceof Response) return gate;
 
-	const row = await c.env.DB.prepare(
-		`SELECT r2_key FROM job_moisture_maps WHERE id = ? AND job_id = ?`,
+	const user = c.get("user")!;
+	if (!canVoidClaimData(user)) return c.text("Forbidden", 403);
+
+	const form = await c.req.parseBody();
+	const reason = normalizeVoidReason(form.void_reason);
+	if (!reason) return c.text("Void reason required (at least 3 characters)", 400);
+
+	const result = await c.env.DB.prepare(
+		`UPDATE job_moisture_maps
+     SET voided_at = datetime('now'), voided_by = ?, void_reason = ?
+     WHERE id = ? AND job_id = ? AND voided_at IS NULL`,
 	)
-		.bind(mapId, id)
-		.first<{ r2_key: string }>();
-	if (!row) return c.notFound();
-	await c.env.UPLOADS.delete(row.r2_key);
+		.bind(user.id, reason, mapId, id)
+		.run();
+	if (!result.meta.changes) return c.text("Map not found or already voided", 404);
+
 	await c.env.DB.prepare(
-		`DELETE FROM job_moisture_maps WHERE id = ? AND job_id = ?`,
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
 	)
-		.bind(mapId, id)
+		.bind(id)
 		.run();
 	return c.redirect(`/jobs/${id}`);
 });
@@ -4627,7 +4705,7 @@ app.get("/inventory/:id", async (c) => {
       </div>
       <div><label for="notes">Notes</label>
         <textarea id="notes" name="notes">${escapeHtml(asset.notes)}</textarea></div>
-      <p class="muted">Setting status to Available while on a job does not auto-return the assignment — use Return on the job page.</p>
+      <p class="muted">While a unit is on a job, status must stay <strong>On job</strong>. Use Return on the job page before Available / Maintenance / Retired.</p>
       <button class="btn" type="submit">Save</button>
     </form>
     <h2>Assignment history</h2>
@@ -4648,6 +4726,19 @@ app.post("/inventory/:id", async (c) => {
 	if (!label || !isValidEquipmentType(equipmentType) || !isValidAssetStatus(status)) {
 		return c.text("Label, type, and status required", 400);
 	}
+
+	const open = await c.env.DB.prepare(
+		`SELECT id FROM job_equipment WHERE asset_id = ? AND returned_at IS NULL LIMIT 1`,
+	)
+		.bind(id)
+		.first<{ id: string }>();
+	if (!canSetAssetStatusWithOpenAssignment(status, !!open)) {
+		return c.text(
+			"Unit is assigned to an active job — return it on the job page before changing status off On job.",
+			400,
+		);
+	}
+
 	await c.env.DB.prepare(
 		`UPDATE equipment_assets SET
       label = ?, equipment_type = ?, serial = ?, status = ?, notes = ?,
@@ -4809,7 +4900,7 @@ app.get("/reports/field-logs.csv", async (c) => {
 	}
 
 	const sql = `SELECT l.id, l.kind, l.logged_at, l.area, l.reading, l.equipment_type,
-      l.equipment_count, l.notes, l.created_at,
+      l.equipment_count, l.notes, l.created_at, l.voided_at, l.void_reason,
       j.id AS job_id, j.title AS job_title, j.job_type,
       c.name AS customer_name, u.name AS logged_by
      FROM job_field_logs l
@@ -4838,6 +4929,8 @@ app.get("/reports/field-logs.csv", async (c) => {
 			r.notes as string,
 			r.logged_by as string,
 			r.created_at as string,
+			r.voided_at as string,
+			r.void_reason as string,
 		],
 	);
 
@@ -4858,6 +4951,8 @@ app.get("/reports/field-logs.csv", async (c) => {
 			"notes",
 			"logged_by",
 			"created_at",
+			"voided_at",
+			"void_reason",
 		],
 		rows,
 	);

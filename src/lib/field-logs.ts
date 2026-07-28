@@ -30,6 +30,8 @@ export type FieldLogRow = {
 	notes: string | null;
 	created_at: string;
 	user_name: string | null;
+	voided_at: string | null;
+	void_reason: string | null;
 };
 
 /**

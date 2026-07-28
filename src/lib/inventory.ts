@@ -1,8 +1,9 @@
 /** Simple equipment inventory helpers. */
 
 import { EQUIPMENT_TYPES, equipmentTypeLabel } from "./field-logs";
+import { canSetAssetStatusWithOpenAssignment } from "./void-data";
 
-export { EQUIPMENT_TYPES, equipmentTypeLabel };
+export { EQUIPMENT_TYPES, equipmentTypeLabel, canSetAssetStatusWithOpenAssignment };
 
 export const ASSET_STATUSES = [
 	{ value: "available", label: "Available" },
