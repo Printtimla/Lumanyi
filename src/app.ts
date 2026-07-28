@@ -146,6 +146,7 @@ import {
 import {
 	canManagePriceLists,
 	centsToDollarsInput,
+	dollarsToCents,
 	getPriceItem,
 	listActivePriceItemsForProduct,
 	listPriceItems,
@@ -154,6 +155,14 @@ import {
 	priceListProductLabel,
 	PRICE_LIST_PRODUCTS,
 } from "./lib/price-list";
+import {
+	canManagePrintMargins,
+	getPrintMarginSettings,
+	parseMarginSettingsForm,
+	serializeVolumeTiers,
+	suggestedSellUnitCents,
+	summarizeMarginSettings,
+} from "./lib/print-margins";
 import {
 	canSetAssetStatusWithOpenAssignment,
 	canVoidClaimData,
@@ -1925,6 +1934,105 @@ app.post("/settings/price-lists/:id/active", async (c) => {
 		summary: `${nextActive ? "Reactivated" : "Deactivated"} price list item ${existing.name}`,
 	});
 	return c.redirect(`/settings/price-lists/${id}`);
+});
+
+app.get("/settings/print-margins", async (c) => {
+	if (!canManagePrintMargins(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Print margin rules are Super Admin / Owner only."),
+			403,
+		);
+	}
+	const settings = await getPrintMarginSettings(c.env.DB);
+	const tierRows = [1, 2, 3, 4, 5]
+		.map((i) => {
+			const tier = settings.volume_tiers[i - 1];
+			return `<div class="row">
+        <div><label for="tier_${i}_min">Tier ${i} min qty</label>
+          <input id="tier_${i}_min" name="tier_${i}_min" type="number" step="1" min="0"
+            value="${tier ? escapeHtml(tier.min_qty) : ""}" placeholder="e.g. 500" /></div>
+        <div><label for="tier_${i}_pct">Extra markup %</label>
+          <input id="tier_${i}_pct" name="tier_${i}_pct" type="number" step="0.1"
+            value="${tier ? escapeHtml(tier.markup_pct) : ""}" placeholder="e.g. 5" /></div>
+      </div>`;
+		})
+		.join("");
+
+	const body = `
+    <p><a href="/settings/price-lists">← Price lists</a></p>
+    <h1>Print margin rules</h1>
+    <p class="muted">Owner defaults for Print Ops quotes. When staff enter a <strong>unit cost</strong> and check
+      <em>Apply margin rules</em>, sell unit price is suggested as:
+      cost × (1+cost-plus%) × (1+material%) × (1+volume tier%) + setup÷qty.
+      Suggested price stays editable. No market rates are invented here — you set the percentages.</p>
+    <p class="muted">Current: ${escapeHtml(summarizeMarginSettings(settings))}</p>
+    <form method="post" action="/settings/print-margins" class="panel stack">
+      <div class="row">
+        <div><label for="cost_plus_pct">Cost-plus markup %</label>
+          <input id="cost_plus_pct" name="cost_plus_pct" type="number" step="0.1" min="0" max="1000"
+            required value="${escapeHtml(settings.cost_plus_pct)}" /></div>
+        <div><label for="material_markup_pct">Material markup %</label>
+          <input id="material_markup_pct" name="material_markup_pct" type="number" step="0.1" min="0" max="1000"
+            required value="${escapeHtml(settings.material_markup_pct)}" /></div>
+        <div><label for="setup_fee_dollars">Setup fee ($)</label>
+          <input id="setup_fee_dollars" name="setup_fee_dollars" type="number" step="0.01" min="0"
+            required value="${escapeHtml(centsToDollarsInput(settings.setup_fee_cents))}" /></div>
+      </div>
+      <h2>Volume tiers (optional)</h2>
+      <p class="muted">Highest matching min qty wins. Leave blank to skip.</p>
+      ${tierRows}
+      <button class="btn" type="submit">Save print margins</button>
+    </form>`;
+	return c.html(page(c, "Print margins", body));
+});
+
+app.post("/settings/print-margins", async (c) => {
+	if (!canManagePrintMargins(c.get("user")!)) return c.text("Forbidden", 403);
+	const form = await c.req.parseBody();
+	const parsed = parseMarginSettingsForm(form as Record<string, unknown>);
+	if (!parsed.ok) return c.text(parsed.error, 400);
+	const before = await getPrintMarginSettings(c.env.DB);
+	await c.env.DB.prepare(
+		`INSERT INTO print_margin_settings (
+      id, cost_plus_pct, material_markup_pct, setup_fee_cents, volume_tiers_json, updated_at, updated_by
+    ) VALUES ('default', ?, ?, ?, ?, datetime('now'), ?)
+    ON CONFLICT(id) DO UPDATE SET
+      cost_plus_pct = excluded.cost_plus_pct,
+      material_markup_pct = excluded.material_markup_pct,
+      setup_fee_cents = excluded.setup_fee_cents,
+      volume_tiers_json = excluded.volume_tiers_json,
+      updated_at = datetime('now'),
+      updated_by = excluded.updated_by`,
+	)
+		.bind(
+			parsed.cost_plus_pct,
+			parsed.material_markup_pct,
+			parsed.setup_fee_cents,
+			serializeVolumeTiers(parsed.volume_tiers),
+			c.get("user")!.id,
+		)
+		.run();
+	await recordAudit(c, {
+		action: "print_margin_update",
+		entityType: "print_margin_settings",
+		entityId: "default",
+		summary: "Updated print margin rules",
+		detail: {
+			before: {
+				cost_plus_pct: before.cost_plus_pct,
+				material_markup_pct: before.material_markup_pct,
+				setup_fee_cents: before.setup_fee_cents,
+				volume_tiers: before.volume_tiers,
+			},
+			after: {
+				cost_plus_pct: parsed.cost_plus_pct,
+				material_markup_pct: parsed.material_markup_pct,
+				setup_fee_cents: parsed.setup_fee_cents,
+				volume_tiers: parsed.volume_tiers,
+			},
+		},
+	});
+	return c.redirect("/settings/print-margins");
 });
 
 app.get("/", async (c) => {
@@ -6208,7 +6316,8 @@ app.get("/print/:id", async (c) => {
 		.bind(id)
 		.all<{ id: string; kind: string; filename: string; created_at: string }>();
 	const lines = await c.env.DB.prepare(
-		`SELECT * FROM print_quote_lines WHERE print_job_id = ? ORDER BY sort_order, description`,
+		`SELECT id, description, quantity, unit, unit_cents, cost_unit_cents
+     FROM print_quote_lines WHERE print_job_id = ? ORDER BY sort_order, description`,
 	)
 		.bind(id)
 		.all<{
@@ -6217,7 +6326,10 @@ app.get("/print/:id", async (c) => {
 			quantity: number;
 			unit: string;
 			unit_cents: number;
+			cost_unit_cents: number | null;
 		}>();
+
+	const marginSettings = await getPrintMarginSettings(c.env.DB);
 
 	const statusOptions = PRINT_STATUSES.map(
 		(s) =>
@@ -6266,6 +6378,7 @@ app.get("/print/:id", async (c) => {
 				return `<tr>
         <td>${escapeHtml(l.description)}</td>
         <td>${escapeHtml(l.quantity)} ${escapeHtml(l.unit)}</td>
+        <td class="muted">${l.cost_unit_cents != null ? escapeHtml(money(l.cost_unit_cents)) : "—"}</td>
         <td>${escapeHtml(money(l.unit_cents))}</td>
         <td>${escapeHtml(money(total))}</td>
         <td>
@@ -6275,7 +6388,7 @@ app.get("/print/:id", async (c) => {
         </td>
       </tr>`;
 			})
-			.join("") || `<tr><td colspan="5" class="muted">No quote lines yet.</td></tr>`;
+			.join("") || `<tr><td colspan="6" class="muted">No quote lines yet.</td></tr>`;
 
 	const proofActions = `
     <div class="toolbar" style="flex-wrap:wrap">
@@ -6424,17 +6537,30 @@ app.get("/print/:id", async (c) => {
     <ul class="checklist">${fileItems}</ul>
 
     <h2>Quote lines</h2>
+    <p class="muted">Owner margin rules: ${escapeHtml(summarizeMarginSettings(marginSettings))}
+      ${canManagePrintMargins(user) ? `· <a href="/settings/print-margins">Edit</a>` : ""}</p>
     <table>
-      <thead><tr><th>Description</th><th>Qty</th><th>Unit $</th><th>Total</th><th></th></tr></thead>
+      <thead><tr><th>Description</th><th>Qty</th><th>Unit cost</th><th>Unit $</th><th>Total</th><th></th></tr></thead>
       <tbody>${lineRows}</tbody>
     </table>
     <form method="post" action="/print/${escapeHtml(id)}/quote" class="panel stack" style="margin-top:0.75rem">
       <div class="row">
-        <div><label for="description">Description</label><input id="description" name="description" required placeholder="4/4 100# cover, 5.5x8.5" /></div>
-        <div><label for="quantity">Qty</label><input id="quantity" name="quantity" type="number" step="0.01" min="0" value="1" required /></div>
+        <div class="grow"><label for="description">Description</label>
+          <input id="description" name="description" required placeholder="4/4 100# cover, 5.5x8.5" /></div>
+        <div><label for="quantity">Qty</label>
+          <input id="quantity" name="quantity" type="number" step="0.01" min="0" value="1" required /></div>
         <div><label for="unit">Unit</label><input id="unit" name="unit" value="ea" required /></div>
-        <div><label for="unit_dollars">Unit price ($)</label><input id="unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" value="0" required /></div>
       </div>
+      <div class="row">
+        <div><label for="cost_unit_dollars">Unit cost ($)</label>
+          <input id="cost_unit_dollars" name="cost_unit_dollars" type="number" step="0.01" min="0" placeholder="optional" /></div>
+        <div><label for="unit_dollars">Unit sell ($)</label>
+          <input id="unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" value="0" required /></div>
+      </div>
+      <label style="font-weight:400">
+        <input type="checkbox" name="apply_margin" value="1" />
+        Apply Owner margin rules to unit sell (uses unit cost + qty; overwrites unit sell)
+      </label>
       <button class="btn" type="submit">Add line</button>
     </form>`;
 
@@ -6628,23 +6754,37 @@ app.post("/print/:id/quote", async (c) => {
 	const id = c.req.param("id");
 	const form = await c.req.parseBody();
 	const quantity = parseFloat(String(form.quantity || "1"));
-	const unitDollars = parseFloat(String(form.unit_dollars || "0"));
+	const qty = Number.isFinite(quantity) ? quantity : 1;
+	const costUnitCents = dollarsToCents(form.cost_unit_dollars);
+	let unitCents = Number.isFinite(parseFloat(String(form.unit_dollars || "0")))
+		? Math.round(parseFloat(String(form.unit_dollars || "0")) * 100)
+		: 0;
+	const applyMargin = String(form.apply_margin || "") === "1";
+	if (applyMargin) {
+		if (costUnitCents == null) {
+			return c.text("Unit cost required when applying margin rules", 400);
+		}
+		const settings = await getPrintMarginSettings(c.env.DB);
+		unitCents = suggestedSellUnitCents(costUnitCents, qty, settings);
+	}
 	const count = await c.env.DB.prepare(
 		`SELECT COUNT(*) AS c FROM print_quote_lines WHERE print_job_id = ?`,
 	)
 		.bind(id)
 		.first<{ c: number }>();
 	await c.env.DB.prepare(
-		`INSERT INTO print_quote_lines (id, print_job_id, description, quantity, unit, unit_cents, sort_order)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO print_quote_lines (
+      id, print_job_id, description, quantity, unit, unit_cents, cost_unit_cents, sort_order
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 		.bind(
 			newId("pql"),
 			id,
 			String(form.description || "").trim(),
-			Number.isFinite(quantity) ? quantity : 1,
+			qty,
 			String(form.unit || "ea").trim() || "ea",
-			Number.isFinite(unitDollars) ? Math.round(unitDollars * 100) : 0,
+			unitCents,
+			costUnitCents,
 			count?.c ?? 0,
 		)
 		.run();

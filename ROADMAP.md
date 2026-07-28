@@ -89,6 +89,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] SA-4: Owner hard delete from Trash (password re-entry; customers / field jobs / print jobs + R2)
 - [x] SA-5: Append-only audit log (soft/hard delete, restore, void, user admin) + Owner read-only Audit page
 - [x] SA-6.1: Owner price lists (restoration + floors) + estimate pick-to-prefill; audited create/update/deactivate
+- [x] SA-6.2: Owner print margin rules (cost-plus, setup, volume, material) + quote apply-from-cost
 
 ## Phase 6 — Multi-brand
 
