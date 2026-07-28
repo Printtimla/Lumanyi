@@ -9,6 +9,7 @@ import { canAccessTrash } from "./soft-delete";
 import { canViewAudit } from "./audit";
 import { canManagePriceLists } from "./price-list";
 import { canManagePrintMargins } from "./print-margins";
+import { canManageLaborRates } from "./labor-rates";
 
 export function escapeHtml(value: string | number | null | undefined): string {
 	return String(value ?? "")
@@ -60,6 +61,9 @@ export function layout(opts: {
 		}
 		if (canManagePrintMargins(u)) {
 			items.push({ href: "/settings/print-margins", label: "Print margins" });
+		}
+		if (canManageLaborRates(u)) {
+			items.push({ href: "/settings/labor-rates", label: "Labor rates" });
 		}
 		items.push({ href: "/inventory", label: "Inventory" });
 		if (canSeeOfficeTools(u)) {

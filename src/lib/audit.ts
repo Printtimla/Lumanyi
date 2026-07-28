@@ -17,7 +17,8 @@ export type AuditAction =
 	| "price_list_update"
 	| "price_list_deactivate"
 	| "price_list_reactivate"
-	| "print_margin_update";
+	| "print_margin_update"
+	| "labor_rate_update";
 
 export type AuditEntityType =
 	| "customer"
@@ -28,7 +29,8 @@ export type AuditEntityType =
 	| "moisture_map"
 	| "user"
 	| "price_list_item"
-	| "print_margin_settings";
+	| "print_margin_settings"
+	| "labor_rate";
 
 export type AuditEventInput = {
 	actorUserId: string | null;

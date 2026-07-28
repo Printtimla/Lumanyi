@@ -90,6 +90,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] SA-5: Append-only audit log (soft/hard delete, restore, void, user admin) + Owner read-only Audit page
 - [x] SA-6.1: Owner price lists (restoration + floors) + estimate pick-to-prefill; audited create/update/deactivate
 - [x] SA-6.2: Owner print margin rules (cost-plus, setup, volume, material) + quote apply-from-cost
+- [x] SA-6.3: Owner internal labor rates by designation + job-cost prefill (not payroll)
 
 ## Phase 6 — Multi-brand
 

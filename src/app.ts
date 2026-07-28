@@ -164,6 +164,15 @@ import {
 	summarizeMarginSettings,
 } from "./lib/print-margins";
 import {
+	activeHourlyCents,
+	canManageLaborRates,
+	getLaborRate,
+	laborCostPrefill,
+	laborRateDesignations,
+	listLaborRates,
+	parseLaborRateForm,
+} from "./lib/labor-rates";
+import {
 	canSetAssetStatusWithOpenAssignment,
 	canVoidClaimData,
 	normalizeVoidReason,
@@ -2033,6 +2042,97 @@ app.post("/settings/print-margins", async (c) => {
 		},
 	});
 	return c.redirect("/settings/print-margins");
+});
+
+app.get("/settings/labor-rates", async (c) => {
+	if (!canManageLaborRates(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Labor rates are Super Admin / Owner only."),
+			403,
+		);
+	}
+	const rates = await listLaborRates(c.env.DB);
+	const byDesignation = new Map(rates.map((r) => [r.designation, r]));
+	const rows = laborRateDesignations()
+		.map((d) => {
+			const row = byDesignation.get(d.value);
+			const hourly = row?.hourly_cents ?? 0;
+			const active = row?.active ?? 1;
+			return `<tr${active ? "" : ' style="opacity:0.55"'}>
+        <td>${escapeHtml(d.label)}${active ? "" : ' <span class="muted">(inactive)</span>'}</td>
+        <td>
+          <form method="post" action="/settings/labor-rates" class="toolbar" style="align-items:end;gap:0.5rem">
+            <input type="hidden" name="designation" value="${escapeHtml(d.value)}" />
+            <div>
+              <label for="hourly_${escapeHtml(d.value)}">$/hr</label>
+              <input id="hourly_${escapeHtml(d.value)}" name="hourly_dollars" type="number" step="0.01" min="0"
+                required value="${escapeHtml((hourly / 100).toFixed(2))}" style="max-width:7rem" />
+            </div>
+            <label style="font-weight:400">
+              <input type="checkbox" name="active" value="1"${active ? " checked" : ""} /> Active
+            </label>
+            <button class="btn secondary" type="submit">Save</button>
+          </form>
+        </td>
+      </tr>`;
+		})
+		.join("");
+
+	const body = `
+    <p><a href="/settings/print-margins">← Print margins</a> · <a href="/settings/price-lists">Price lists</a></p>
+    <h1>Labor rates</h1>
+    <p class="muted">Internal hourly rates by designation for job-cost margin math.
+      <strong>Not payroll</strong> — staff pay is not stored or calculated here.
+      On a field job, use <em>Use labor rate</em> to prefill a labor cost line.</p>
+    <table>
+      <thead><tr><th>Designation</th><th>Internal rate</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+	return c.html(page(c, "Labor rates", body));
+});
+
+app.post("/settings/labor-rates", async (c) => {
+	if (!canManageLaborRates(c.get("user")!)) return c.text("Forbidden", 403);
+	const form = await c.req.parseBody();
+	// Checkbox omitted when unchecked — treat missing active as 0.
+	if (!("active" in form)) {
+		(form as Record<string, unknown>).active = "0";
+	}
+	const parsed = parseLaborRateForm(form as Record<string, unknown>);
+	if (!parsed.ok) return c.text(parsed.error, 400);
+	const before = await getLaborRate(c.env.DB, parsed.designation);
+	await c.env.DB.prepare(
+		`INSERT INTO labor_rates (designation, hourly_cents, active, updated_at, updated_by)
+     VALUES (?, ?, ?, datetime('now'), ?)
+     ON CONFLICT(designation) DO UPDATE SET
+       hourly_cents = excluded.hourly_cents,
+       active = excluded.active,
+       updated_at = datetime('now'),
+       updated_by = excluded.updated_by`,
+	)
+		.bind(
+			parsed.designation,
+			parsed.hourly_cents,
+			parsed.active,
+			c.get("user")!.id,
+		)
+		.run();
+	await recordAudit(c, {
+		action: "labor_rate_update",
+		entityType: "labor_rate",
+		entityId: parsed.designation,
+		summary: `Updated labor rate for ${roleLabel(parsed.designation)}`,
+		detail: {
+			before: before
+				? { hourly_cents: before.hourly_cents, active: before.active }
+				: null,
+			after: {
+				hourly_cents: parsed.hourly_cents,
+				active: parsed.active,
+			},
+		},
+	});
+	return c.redirect("/settings/labor-rates");
 });
 
 app.get("/", async (c) => {
@@ -3924,6 +4024,20 @@ app.get("/jobs/:id", async (c) => {
 		return { ...cat, sub };
 	}).filter((c) => c.sub > 0);
 
+	const costLaborDesignation = String(c.req.query("cost_labor") || "").trim();
+	let prefillCost: {
+		category: string;
+		description: string;
+		unit: string;
+		unit_dollars: string;
+	} | null = null;
+	if (costLaborDesignation) {
+		const hourly = await activeHourlyCents(c.env.DB, costLaborDesignation);
+		if (hourly != null) {
+			prefillCost = laborCostPrefill(costLaborDesignation, hourly);
+		}
+	}
+
 	const costRows =
 		costLines
 			.map(
@@ -3946,7 +4060,7 @@ app.get("/jobs/:id", async (c) => {
 
 	const costCategoryOptions = COST_CATEGORIES.map(
 		(c) =>
-			`<option value="${escapeHtml(c.value)}">${escapeHtml(c.label)}</option>`,
+			`<option value="${escapeHtml(c.value)}"${prefillCost?.category === c.value ? " selected" : ""}>${escapeHtml(c.label)}</option>`,
 	).join("");
 
 	const costBreakdown =
@@ -3957,6 +4071,27 @@ app.get("/jobs/:id", async (c) => {
 			)
 			.join(" · ") || "—";
 
+	const laborRateOptions = laborRateDesignations()
+		.map(
+			(d) =>
+				`<option value="${escapeHtml(d.value)}"${costLaborDesignation === d.value ? " selected" : ""}>${escapeHtml(d.label)}</option>`,
+		)
+		.join("");
+
+	const laborPicker = `
+    <form method="get" action="/jobs/${escapeHtml(id)}" class="panel toolbar" style="align-items:end;margin-bottom:0.75rem">
+      <div class="grow">
+        <label for="cost_labor">Use labor rate (internal — not payroll)</label>
+        <select id="cost_labor" name="cost_labor">
+          <option value="">Select designation…</option>
+          ${laborRateOptions}
+        </select>
+      </div>
+      <button class="btn secondary" type="submit">Use rate</button>
+      ${canManageLaborRates(user) ? `<a class="btn secondary" href="/settings/labor-rates">Manage rates</a>` : ""}
+    </form>
+    <p class="muted" style="font-size:0.85rem;margin-top:0">Prefills category Labor, unit hr, and unit cost from Owner rates. Edit before saving.</p>`;
+
 	const costSection = `
     <h2>Job costs</h2>
     <p class="muted">Track labor, materials, and equipment days against the estimate. Internal only — not payroll.</p>
@@ -3966,20 +4101,25 @@ app.get("/jobs/:id", async (c) => {
       · <strong>Margin:</strong> ${jobMargin == null ? "—" : escapeHtml(money(jobMargin))}
       <div class="muted" style="margin-top:0.35rem;font-size:0.85rem">${costBreakdown}</div>
     </div>
+    ${laborPicker}
     <form method="post" action="/jobs/${escapeHtml(id)}/costs" class="panel stack" style="margin-bottom:1rem">
       <div class="row">
         <div><label for="cost_category">Category</label>
           <select id="cost_category" name="category" required>${costCategoryOptions}</select></div>
         <div class="grow"><label for="cost_description">Description</label>
-          <input id="cost_description" name="description" required placeholder="Tech hours, poly sheeting, dehumidifier days…" /></div>
+          <input id="cost_description" name="description" required
+            placeholder="Tech hours, poly sheeting, dehumidifier days…"
+            value="${escapeHtml(prefillCost?.description)}" /></div>
       </div>
       <div class="row">
         <div><label for="cost_qty">Qty</label>
           <input id="cost_qty" name="quantity" type="number" step="0.01" min="0" value="1" required /></div>
         <div><label for="cost_unit">Unit</label>
-          <input id="cost_unit" name="unit" placeholder="hr / ea / day" /></div>
+          <input id="cost_unit" name="unit" placeholder="hr / ea / day"
+            value="${escapeHtml(prefillCost?.unit || "")}" /></div>
         <div><label for="cost_unit_dollars">Unit cost ($)</label>
-          <input id="cost_unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" required /></div>
+          <input id="cost_unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" required
+            value="${escapeHtml(prefillCost?.unit_dollars || "")}" /></div>
       </div>
       <button class="btn" type="submit">Add cost line</button>
     </form>
