@@ -1,8 +1,9 @@
--- Expand user roles with lead_tech designation. SQLite cannot ALTER CHECK in place.
+-- Expand user roles with lead_tech.
+-- Rename + recreate (do not DROP users while FKs point at it — fails on D1 remote).
 
-PRAGMA foreign_keys = OFF;
+ALTER TABLE users RENAME TO users_old;
 
-CREATE TABLE users_new (
+CREATE TABLE users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL,
@@ -13,13 +14,8 @@ CREATE TABLE users_new (
   must_change_password INTEGER NOT NULL DEFAULT 0
 );
 
-INSERT INTO users_new (id, email, name, password_hash, role, created_at, must_change_password)
+INSERT INTO users (id, email, name, password_hash, role, created_at, must_change_password)
 SELECT id, email, name, password_hash, role, created_at, must_change_password
-FROM users;
+FROM users_old;
 
-DROP TABLE users;
-ALTER TABLE users_new RENAME TO users;
-
-CREATE INDEX IF NOT EXISTS idx_jobs_assigned ON jobs(assigned_user_id);
-
-PRAGMA foreign_keys = ON;
+DROP TABLE users_old;
