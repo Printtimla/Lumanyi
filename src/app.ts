@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context, Next } from "hono";
 import { getCookie } from "hono/cookie";
 import {
 	SESSION_COOKIE,
@@ -41,6 +42,7 @@ import {
 	isValidFieldJobType,
 	jobTypeLabel,
 	normalizeJobType,
+	type ProductKey,
 } from "./lib/products";
 import {
 	assigneeOptionLabel,
@@ -93,6 +95,27 @@ import {
 	sumCostCents,
 } from "./lib/job-costs";
 import { buildWaterLossPdf, parseOptionalNumber } from "./lib/water-loss";
+import {
+	ALL_PRODUCTS,
+	appendFieldJobListFilters,
+	canAccessProduct,
+	canManageUsers,
+	canReadFieldJob,
+	canReadPrintJob,
+	canSeeOfficeTools,
+	canWriteFieldJob,
+	canWritePrintJob,
+	isStatusLocked,
+	jobTypeAllowedForUser,
+	fieldJobVisibility,
+	parseProducts,
+	printJobVisibility,
+	productLabel,
+	productsFromForm,
+	serializeProducts,
+	type FieldJobAccess,
+	type PrintJobAccess,
+} from "./lib/access";
 
 const RESTORATION_SQL_TYPES = [
 	...RESTORATION_TYPES.map((t) => t.value),
@@ -109,6 +132,8 @@ type Variables = {
 	user?: AppUser;
 	portalCustomer: PortalCustomer | null;
 	flash: string | null;
+	fieldJobAccess?: FieldJobAccess;
+	printJobAccess?: PrintJobAccess;
 };
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -132,6 +157,41 @@ function page(
 		user: user ?? (c.get("user") as AppUser | null),
 		flash: (c.get("flash") as string | null) ?? null,
 	});
+}
+
+function forbiddenHtml(
+	c: { get: (key: "user" | "flash") => unknown },
+	message = "You do not have access to this.",
+) {
+	return page(
+		c,
+		"Forbidden",
+		`<h1>Forbidden</h1><p class="muted">${escapeHtml(message)}</p>`,
+	);
+}
+
+async function loadFieldJobAccess(
+	db: D1Database,
+	id: string,
+): Promise<FieldJobAccess | null> {
+	return db
+		.prepare(
+			`SELECT id, status, assigned_user_id, job_type FROM jobs WHERE id = ?`,
+		)
+		.bind(id)
+		.first<FieldJobAccess>();
+}
+
+async function loadPrintJobAccess(
+	db: D1Database,
+	id: string,
+): Promise<PrintJobAccess | null> {
+	return db
+		.prepare(
+			`SELECT id, status, assigned_user_id FROM print_jobs WHERE id = ?`,
+		)
+		.bind(id)
+		.first<PrintJobAccess>();
 }
 
 function portalPage(title: string, customer: PortalCustomer, body: string) {
@@ -205,6 +265,93 @@ app.use("/portal/*", async (c, next) => {
 	c.set("portalCustomer", customer);
 	return next();
 });
+
+/** Field job RLS + status lock for /jobs/:id and nested routes. */
+async function enforceFieldJobRoute(
+	c: Context<{ Bindings: Env; Variables: Variables }>,
+	next: Next,
+) {
+	const id = c.req.param("id");
+	if (!id || id === "new" || id === "export.csv") return next();
+	const user = c.get("user");
+	if (!user) return next();
+	const job = await loadFieldJobAccess(c.env.DB, id);
+	if (!job) return c.notFound();
+	const method = c.req.method.toUpperCase();
+	const readOnly = method === "GET" || method === "HEAD";
+	if (readOnly) {
+		if (!canReadFieldJob(user, job)) {
+			return c.html(
+				forbiddenHtml(
+					c,
+					"You can only open field jobs assigned to you (for your products).",
+				),
+				403,
+			);
+		}
+	} else if (!canWriteFieldJob(user, job)) {
+		const locked = isStatusLocked(job.status);
+		return c.html(
+			forbiddenHtml(
+				c,
+				locked
+					? "This job is locked (complete / invoiced). Owner or dispatcher can reopen it."
+					: "You can only edit field jobs assigned to you.",
+			),
+			403,
+		);
+	}
+	c.set("fieldJobAccess", job);
+	return next();
+}
+
+app.use("/jobs/:id", enforceFieldJobRoute);
+app.use("/jobs/:id/*", enforceFieldJobRoute);
+
+/** Print job RLS + status lock for /print/:id and nested routes. */
+async function enforcePrintJobRoute(
+	c: Context<{ Bindings: Env; Variables: Variables }>,
+	next: Next,
+) {
+	const id = c.req.param("id");
+	if (!id || id === "new" || id === "board") return next();
+	const user = c.get("user");
+	if (!user) return next();
+	if (!canAccessProduct(user, "print")) {
+		return c.html(
+			forbiddenHtml(c, "Your account does not include Print Ops."),
+			403,
+		);
+	}
+	const job = await loadPrintJobAccess(c.env.DB, id);
+	if (!job) return c.notFound();
+	const method = c.req.method.toUpperCase();
+	const readOnly = method === "GET" || method === "HEAD";
+	if (readOnly) {
+		if (!canReadPrintJob(user, job)) {
+			return c.html(
+				forbiddenHtml(
+					c,
+					"You can only open print jobs assigned to you.",
+				),
+				403,
+			);
+		}
+	} else if (!canWritePrintJob(user, job)) {
+		return c.html(
+			forbiddenHtml(
+				c,
+				"This print job is locked or not assigned to you. Owner or dispatcher can reopen delivered jobs.",
+			),
+			403,
+		);
+	}
+	c.set("printJobAccess", job);
+	return next();
+}
+
+app.use("/print/:id", enforcePrintJobRoute);
+app.use("/print/:id/*", enforcePrintJobRoute);
 
 app.get("/health", (c) => c.json({ ok: true, app: "lumanyi" }));
 
@@ -724,7 +871,7 @@ app.post("/account/password", async (c) => {
 });
 
 app.get("/users", async (c) => {
-	if (c.get("user")!.role !== "owner") {
+	if (!canManageUsers(c.get("user")!)) {
 		return c.html(
 			page(c, "Users", `<h1>Users</h1><p class="muted">Owner access only.</p>`),
 			403,
@@ -732,7 +879,7 @@ app.get("/users", async (c) => {
 	}
 	const list = await c.env.DB.prepare(
 		`SELECT id, name, email, role, COALESCE(designation, role) AS designation,
-      must_change_password, created_at
+      products, must_change_password, created_at
      FROM users ORDER BY name COLLATE NOCASE`,
 	).all<{
 		id: string;
@@ -740,28 +887,54 @@ app.get("/users", async (c) => {
 		email: string;
 		role: string;
 		designation: string;
+		products: string | null;
 		must_change_password: number;
 		created_at: string;
 	}>();
 
 	const rows =
 		list.results
-			?.map(
-				(u) => `<tr>
+			?.map((u) => {
+				const prods = parseProducts(u.products)
+					.map((p) => productLabel(p))
+					.join(", ");
+				const checks = ALL_PRODUCTS.map(
+					(p) => {
+						const on = parseProducts(u.products).includes(p);
+						return `<label style="margin-right:0.75rem;font-weight:400">
+              <input type="checkbox" name="product_${p}" ${on ? "checked" : ""} /> ${escapeHtml(productLabel(p))}
+            </label>`;
+					},
+				).join("");
+				return `<tr>
         <td>${escapeHtml(u.name)}</td>
         <td>${escapeHtml(u.email)}</td>
         <td>${escapeHtml(roleLabel(u.designation))}</td>
+        <td>${escapeHtml(prods)}</td>
         <td>${u.must_change_password ? "Must change" : "OK"}</td>
-      </tr>`,
-			)
+        <td>
+          <form method="post" action="/users/${escapeHtml(u.id)}/products" class="inline" style="display:flex;flex-wrap:wrap;gap:0.25rem;align-items:center">
+            ${checks}
+            <button class="btn secondary" type="submit" style="padding:0.25rem 0.5rem;font-size:0.85rem">Save</button>
+          </form>
+        </td>
+      </tr>`;
+			})
 			.join("") || "";
+
+	const createProductChecks = ALL_PRODUCTS.map(
+		(p) =>
+			`<label style="margin-right:1rem;font-weight:400">
+        <input type="checkbox" name="product_${p}" checked /> ${escapeHtml(productLabel(p))}
+      </label>`,
+	).join("");
 
 	const body = `
     <div class="toolbar">
       <div class="grow"><h1 style="margin:0">Users</h1></div>
     </div>
     <table>
-      <thead><tr><th>Name</th><th>Email</th><th>Designation</th><th>Password</th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th>Designation</th><th>Products</th><th>Password</th><th>Edit products</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <h2>Add user</h2>
@@ -785,7 +958,11 @@ app.get("/users", async (c) => {
           <input id="temp_password" name="temp_password" type="text" required minlength="8" value="Lumanyi1!" />
         </div>
       </div>
-      <p class="muted">New users must change password on first login.</p>
+      <div>
+        <span class="muted">Products</span><br />
+        ${createProductChecks}
+      </div>
+      <p class="muted">New users must change password on first login. Techs only see jobs assigned to them within their products.</p>
       <button class="btn" type="submit">Create user</button>
     </form>`;
 
@@ -793,7 +970,7 @@ app.get("/users", async (c) => {
 });
 
 app.post("/users", async (c) => {
-	if (c.get("user")!.role !== "owner") return c.text("Forbidden", 403);
+	if (!canManageUsers(c.get("user")!)) return c.text("Forbidden", 403);
 	const form = await c.req.parseBody();
 	const name = String(form.name || "").trim();
 	const email = String(form.email || "")
@@ -816,19 +993,69 @@ app.post("/users", async (c) => {
 
 	const passwordHash = await hashPassword(tempPassword);
 	const permissionRole = permissionRoleFor(role);
+	const products = serializeProducts(productsFromForm(form as Record<string, unknown>));
 	await c.env.DB.prepare(
-		`INSERT INTO users (id, email, name, password_hash, role, designation, must_change_password)
-     VALUES (?, ?, ?, ?, ?, ?, 1)`,
+		`INSERT INTO users (id, email, name, password_hash, role, designation, products, must_change_password)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
 	)
-		.bind(newId("usr"), email, name, passwordHash, permissionRole, role)
+		.bind(
+			newId("usr"),
+			email,
+			name,
+			passwordHash,
+			permissionRole,
+			role,
+			products,
+		)
+		.run();
+	return c.redirect("/users");
+});
+
+app.post("/users/:id/products", async (c) => {
+	if (!canManageUsers(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const products = serializeProducts(productsFromForm(form as Record<string, unknown>));
+	const row = await c.env.DB.prepare(`SELECT id FROM users WHERE id = ?`)
+		.bind(id)
+		.first();
+	if (!row) return c.notFound();
+	await c.env.DB.prepare(`UPDATE users SET products = ? WHERE id = ?`)
+		.bind(products, id)
 		.run();
 	return c.redirect("/users");
 });
 
 app.get("/", async (c) => {
+	const user = c.get("user")!;
 	const today = new Date().toISOString().slice(0, 10);
+	const office = canSeeOfficeTools(user);
+	const vis = fieldJobVisibility(user);
+	const fieldWhere = ["status != 'cancelled'"];
+	const fieldBinds: string[] = [];
+	if (vis.sql !== "1=1") {
+		fieldWhere.push(vis.sql.replace(/^j\./, ""));
+		fieldBinds.push(...vis.binds);
+	}
+	const hasR = canAccessProduct(user, "restoration");
+	const hasF = canAccessProduct(user, "floors");
+	if (!hasR && !hasF) {
+		fieldWhere.push("0=1");
+	} else if (!(hasR && hasF)) {
+		if (hasR) {
+			fieldWhere.push(
+				`job_type IN (${RESTORATION_SQL_TYPES.map(() => "?").join(",")})`,
+			);
+			fieldBinds.push(...RESTORATION_SQL_TYPES);
+		} else {
+			fieldWhere.push(
+				`job_type IN (${FLOOR_TYPE_VALUES.map(() => "?").join(",")})`,
+			);
+			fieldBinds.push(...FLOOR_TYPE_VALUES);
+		}
+	}
 
-	const fieldCounts = await c.env.DB.prepare(
+	const fieldCountsStmt = c.env.DB.prepare(
 		`SELECT
       SUM(CASE WHEN status = 'lead' THEN 1 ELSE 0 END) AS lead_n,
       SUM(CASE WHEN status = 'estimate' THEN 1 ELSE 0 END) AS estimate_n,
@@ -836,7 +1063,10 @@ app.get("/", async (c) => {
       SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS active_n,
       SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) AS complete_n,
       SUM(CASE WHEN status = 'invoiced' THEN 1 ELSE 0 END) AS invoiced_n
-     FROM jobs WHERE status != 'cancelled'`,
+     FROM jobs WHERE ${fieldWhere.join(" AND ")}`,
+	);
+	const fieldCounts = await (
+		fieldBinds.length ? fieldCountsStmt.bind(...fieldBinds) : fieldCountsStmt
 	).first<{
 		lead_n: number;
 		estimate_n: number;
@@ -846,77 +1076,138 @@ app.get("/", async (c) => {
 		invoiced_n: number;
 	}>();
 
-	const printCounts = await c.env.DB.prepare(
-		`SELECT
-      SUM(CASE WHEN status = 'intake' THEN 1 ELSE 0 END) AS intake_n,
-      SUM(CASE WHEN status = 'proof' THEN 1 ELSE 0 END) AS proof_n,
-      SUM(CASE WHEN status IN ('approved','in_production') THEN 1 ELSE 0 END) AS press_n,
-      SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready_n
-     FROM print_jobs WHERE status != 'cancelled'`,
-	).first<{
+	const printVis = printJobVisibility(user);
+	let printCounts: {
 		intake_n: number;
 		proof_n: number;
 		press_n: number;
 		ready_n: number;
+	} | null = null;
+	if (canAccessProduct(user, "print")) {
+		const printWhere = ["status != 'cancelled'"];
+		const printBinds: string[] = [];
+		if (printVis.sql !== "1=1") {
+			printWhere.push(printVis.sql.replace(/^p\./, ""));
+			printBinds.push(...printVis.binds);
+		}
+		const printStmt = c.env.DB.prepare(
+			`SELECT
+        SUM(CASE WHEN status = 'intake' THEN 1 ELSE 0 END) AS intake_n,
+        SUM(CASE WHEN status = 'proof' THEN 1 ELSE 0 END) AS proof_n,
+        SUM(CASE WHEN status IN ('approved','in_production') THEN 1 ELSE 0 END) AS press_n,
+        SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready_n
+       FROM print_jobs WHERE ${printWhere.join(" AND ")}`,
+		);
+		printCounts = await (printBinds.length
+			? printStmt.bind(...printBinds)
+			: printStmt
+		).first();
+	}
+
+	const listWhere: string[] = [];
+	const listBinds: string[] = [];
+	appendFieldJobListFilters(
+		user,
+		listWhere,
+		listBinds,
+		RESTORATION_SQL_TYPES,
+		FLOOR_TYPE_VALUES,
+	);
+	const listFilter =
+		listWhere.length > 0 ? `AND ${listWhere.join(" AND ")}` : "";
+
+	const overdue = await (listBinds.length
+		? c.env.DB.prepare(
+				`SELECT j.id, j.title, j.follow_up_at, j.status, c.name AS customer_name
+         FROM jobs j
+         JOIN customers c ON c.id = j.customer_id
+         WHERE j.status IN ('lead','estimate')
+           AND j.follow_up_at IS NOT NULL
+           AND date(j.follow_up_at) < date(?)
+           ${listFilter}
+         ORDER BY j.follow_up_at ASC
+         LIMIT 8`,
+			).bind(today, ...listBinds)
+		: c.env.DB.prepare(
+				`SELECT j.id, j.title, j.follow_up_at, j.status, c.name AS customer_name
+         FROM jobs j
+         JOIN customers c ON c.id = j.customer_id
+         WHERE j.status IN ('lead','estimate')
+           AND j.follow_up_at IS NOT NULL
+           AND date(j.follow_up_at) < date(?)
+           ${listFilter}
+         ORDER BY j.follow_up_at ASC
+         LIMIT 8`,
+			).bind(today)
+	).all<{
+		id: string;
+		title: string;
+		follow_up_at: string;
+		status: string;
+		customer_name: string;
 	}>();
 
-	const overdue = await c.env.DB.prepare(
-		`SELECT j.id, j.title, j.follow_up_at, j.status, c.name AS customer_name
-     FROM jobs j
-     JOIN customers c ON c.id = j.customer_id
-     WHERE j.status IN ('lead','estimate')
-       AND j.follow_up_at IS NOT NULL
-       AND date(j.follow_up_at) < date(?)
-     ORDER BY j.follow_up_at ASC
-     LIMIT 8`,
-	)
-		.bind(today)
-		.all<{
-			id: string;
-			title: string;
-			follow_up_at: string;
-			status: string;
-			customer_name: string;
-		}>();
+	const todayJobs = await (listBinds.length
+		? c.env.DB.prepare(
+				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
+         FROM jobs j
+         JOIN customers c ON c.id = j.customer_id
+         WHERE j.status IN ('scheduled','in_progress')
+           AND j.scheduled_start IS NOT NULL
+           AND date(j.scheduled_start) = date(?)
+           ${listFilter}
+         ORDER BY j.scheduled_start ASC
+         LIMIT 12`,
+			).bind(today, ...listBinds)
+		: c.env.DB.prepare(
+				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
+         FROM jobs j
+         JOIN customers c ON c.id = j.customer_id
+         WHERE j.status IN ('scheduled','in_progress')
+           AND j.scheduled_start IS NOT NULL
+           AND date(j.scheduled_start) = date(?)
+           ${listFilter}
+         ORDER BY j.scheduled_start ASC
+         LIMIT 12`,
+			).bind(today)
+	).all<{
+		id: string;
+		title: string;
+		job_type: string;
+		status: string;
+		scheduled_start: string | null;
+		customer_name: string;
+	}>();
 
-	const todayJobs = await c.env.DB.prepare(
-		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
-     FROM jobs j
-     JOIN customers c ON c.id = j.customer_id
-     WHERE j.status IN ('scheduled','in_progress')
-       AND j.scheduled_start IS NOT NULL
-       AND date(j.scheduled_start) = date(?)
-     ORDER BY j.scheduled_start ASC
-     LIMIT 12`,
-	)
-		.bind(today)
-		.all<{
-			id: string;
-			title: string;
-			job_type: string;
-			status: string;
-			scheduled_start: string | null;
-			customer_name: string;
-		}>();
-
-	const upcoming = await c.env.DB.prepare(
-		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
-     FROM jobs j
-     JOIN customers c ON c.id = j.customer_id
-     WHERE j.status IN ('scheduled','in_progress')
-       AND (j.scheduled_start IS NULL OR date(j.scheduled_start) > date(?))
-     ORDER BY COALESCE(j.scheduled_start, '9999') ASC
-     LIMIT 8`,
-	)
-		.bind(today)
-		.all<{
-			id: string;
-			title: string;
-			job_type: string;
-			status: string;
-			scheduled_start: string | null;
-			customer_name: string;
-		}>();
+	const upcoming = await (listBinds.length
+		? c.env.DB.prepare(
+				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
+         FROM jobs j
+         JOIN customers c ON c.id = j.customer_id
+         WHERE j.status IN ('scheduled','in_progress')
+           AND (j.scheduled_start IS NULL OR date(j.scheduled_start) > date(?))
+           ${listFilter}
+         ORDER BY COALESCE(j.scheduled_start, '9999') ASC
+         LIMIT 8`,
+			).bind(today, ...listBinds)
+		: c.env.DB.prepare(
+				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
+         FROM jobs j
+         JOIN customers c ON c.id = j.customer_id
+         WHERE j.status IN ('scheduled','in_progress')
+           AND (j.scheduled_start IS NULL OR date(j.scheduled_start) > date(?))
+           ${listFilter}
+         ORDER BY COALESCE(j.scheduled_start, '9999') ASC
+         LIMIT 8`,
+			).bind(today)
+	).all<{
+		id: string;
+		title: string;
+		job_type: string;
+		status: string;
+		scheduled_start: string | null;
+		customer_name: string;
+	}>();
 
 	const overdueRows =
 		overdue.results
@@ -958,55 +1249,60 @@ app.get("/", async (c) => {
 			.join("") ||
 		`<tr><td colspan="5" class="muted">No later scheduled jobs.</td></tr>`;
 
-	const productCards = PRODUCTS.map(
-		(p) => `<a class="product-card" href="${escapeHtml(p.href)}">
+	const productCards = PRODUCTS.filter((p) => canAccessProduct(user, p.key))
+		.map(
+			(p) => `<a class="product-card" href="${escapeHtml(p.href)}">
       <h2>${escapeHtml(p.title)}</h2>
       <p class="muted">${escapeHtml(p.blurb)}</p>
       ${p.siteHint ? `<p class="muted" style="font-size:0.85rem">${escapeHtml(p.siteHint)}</p>` : ""}
       <span class="btn">Open</span>
     </a>`,
-	).join("");
+		)
+		.join("");
 
 	const fc = fieldCounts;
 	const pc = printCounts;
-	const overdueCount = overdue.results?.length ?? 0;
+	const overdueCount = office ? (overdue.results?.length ?? 0) : 0;
 
-	const body = `
-    <h1>Ops dashboard</h1>
-    <p class="muted">Live snapshot for ${escapeHtml(today)}. Product shells below.</p>
+	const quickLinks: string[] = [];
+	if (office) quickLinks.push(`<a href="/leads">Leads</a>`);
+	quickLinks.push(`<a href="/calendar">Calendar</a>`);
+	if (hasR) quickLinks.push(`<a href="/restoration">Restoration</a>`);
+	if (hasF) quickLinks.push(`<a href="/floors">Floors</a>`);
+	if (canAccessProduct(user, "print")) {
+		quickLinks.push(`<a href="/print/board">Press board</a>`);
+	}
+	if (office) quickLinks.push(`<a href="/reports">Reports</a>`);
+	quickLinks.push(`<a href="/inventory">Inventory</a>`);
+	if (office) quickLinks.push(`<a href="/customers/new">New customer</a>`);
+	quickLinks.push(`<a href="/tech">My day</a>`);
 
-    <div class="quick-links">
-      <a href="/leads">Leads</a>
-      <a href="/calendar">Calendar</a>
-      <a href="/restoration">Restoration</a>
-      <a href="/floors">Floors</a>
-      <a href="/print/board">Press board</a>
-      <a href="/reports">Reports</a>
-      <a href="/inventory">Inventory</a>
-      <a href="/customers/new">New customer</a>
-    </div>
-
-    <h2 style="margin-top:0.5rem">Field jobs</h2>
+	const fieldStats =
+		hasR || hasF
+			? `<h2 style="margin-top:0.5rem">Field jobs</h2>
     <div class="grid" style="margin-bottom:1rem">
-      <a class="stat" href="/leads?stage=lead"><div class="n">${fc?.lead_n ?? 0}</div><div class="l">Lead</div></a>
-      <a class="stat" href="/leads?stage=estimate"><div class="n">${fc?.estimate_n ?? 0}</div><div class="l">Estimate</div></a>
+      ${office ? `<a class="stat" href="/leads?stage=lead"><div class="n">${fc?.lead_n ?? 0}</div><div class="l">Lead</div></a>
+      <a class="stat" href="/leads?stage=estimate"><div class="n">${fc?.estimate_n ?? 0}</div><div class="l">Estimate</div></a>` : ""}
       <a class="stat" href="/jobs?status=scheduled"><div class="n">${fc?.scheduled_n ?? 0}</div><div class="l">Scheduled</div></a>
       <a class="stat" href="/jobs?status=in_progress"><div class="n">${fc?.active_n ?? 0}</div><div class="l">In progress</div></a>
       <a class="stat" href="/jobs?status=complete"><div class="n">${fc?.complete_n ?? 0}</div><div class="l">Complete</div></a>
       <a class="stat" href="/jobs?status=invoiced"><div class="n">${fc?.invoiced_n ?? 0}</div><div class="l">Invoiced</div></a>
-    </div>
+    </div>`
+			: "";
 
-    <h2>Print jobs</h2>
+	const printStats = canAccessProduct(user, "print")
+		? `<h2>Print jobs</h2>
     <div class="grid" style="margin-bottom:1rem">
       <a class="stat" href="/print?status=intake"><div class="n">${pc?.intake_n ?? 0}</div><div class="l">Intake</div></a>
       <a class="stat" href="/print?status=proof"><div class="n">${pc?.proof_n ?? 0}</div><div class="l">Proof</div></a>
       <a class="stat" href="/print/board"><div class="n">${pc?.press_n ?? 0}</div><div class="l">Approved / press</div></a>
       <a class="stat" href="/print?status=ready"><div class="n">${pc?.ready_n ?? 0}</div><div class="l">Ready</div></a>
-    </div>
+    </div>`
+		: "";
 
-    ${
-			overdueCount
-				? `<div class="dash-attn">
+	const overdueBlock = office
+		? overdueCount
+			? `<div class="dash-attn">
       <h2>Overdue follow-ups (${overdueCount})</h2>
       <table>
         <thead><tr><th>Job</th><th>Customer</th><th>Stage</th><th>Follow-up</th></tr></thead>
@@ -1014,8 +1310,35 @@ app.get("/", async (c) => {
       </table>
       <p style="margin:0.75rem 0 0"><a href="/leads">Open lead pipeline →</a></p>
     </div>`
-				: `<p class="muted">No overdue lead follow-ups.</p>`
-		}
+			: `<p class="muted">No overdue lead follow-ups.</p>`
+		: "";
+
+	const newJobBtns: string[] = [];
+	if (hasR && office) {
+		newJobBtns.push(
+			`<a class="btn" href="/jobs/new?product=restoration">New restoration job</a>`,
+		);
+	}
+	if (hasF && office) {
+		newJobBtns.push(
+			`<a class="btn secondary" href="/jobs/new?product=floors">New floor job</a>`,
+		);
+	}
+	if (canAccessProduct(user, "print") && office) {
+		newJobBtns.push(`<a class="btn secondary" href="/print/new">New print job</a>`);
+	}
+
+	const body = `
+    <h1>Ops dashboard</h1>
+    <p class="muted">Live snapshot for ${escapeHtml(today)}. ${office ? "Product shells below." : "Showing jobs assigned to you."}</p>
+
+    <div class="quick-links">
+      ${quickLinks.join("\n      ")}
+    </div>
+
+    ${fieldStats}
+    ${printStats}
+    ${overdueBlock}
 
     <h2>Today's schedule</h2>
     <table>
@@ -1029,30 +1352,52 @@ app.get("/", async (c) => {
       <tbody>${upcomingRows}</tbody>
     </table>
 
-    <h2>Products</h2>
-    <div class="product-grid">${productCards}</div>
-    <div class="toolbar">
-      <a class="btn" href="/jobs/new?product=restoration">New restoration job</a>
-      <a class="btn secondary" href="/jobs/new?product=floors">New floor job</a>
-      <a class="btn secondary" href="/print/new">New print job</a>
-    </div>`;
+    ${
+			productCards
+				? `<h2>Products</h2>
+    <div class="product-grid">${productCards}</div>`
+				: ""
+		}
+    ${
+			newJobBtns.length
+				? `<div class="toolbar">${newJobBtns.join("\n      ")}</div>`
+				: ""
+		}`;
 
 	return c.html(page(c, "Dashboard", body));
 });
 
 app.get("/restoration", async (c) => {
+	if (!canAccessProduct(c.get("user")!, "restoration")) {
+		return c.html(
+			forbiddenHtml(c, "Your account does not include Restoration."),
+			403,
+		);
+	}
 	const q = new URLSearchParams(c.req.query());
 	q.set("product", "restoration");
 	return c.redirect(`/jobs?${q.toString()}`);
 });
 
 app.get("/floors", async (c) => {
+	if (!canAccessProduct(c.get("user")!, "floors")) {
+		return c.html(
+			forbiddenHtml(c, "Your account does not include Floors."),
+			403,
+		);
+	}
 	const q = new URLSearchParams(c.req.query());
 	q.set("product", "floors");
 	return c.redirect(`/jobs?${q.toString()}`);
 });
 
 app.get("/customers", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Customer directory is for owner / dispatcher."),
+			403,
+		);
+	}
 	const q = (c.req.query("q") || "").trim();
 	const list = q
 		? await c.env.DB.prepare(
@@ -1107,6 +1452,12 @@ app.get("/customers", async (c) => {
 });
 
 app.get("/customers/new", (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Customer directory is for owner / dispatcher."),
+			403,
+		);
+	}
 	const body = `
     <h1>New customer</h1>
     <form method="post" action="/customers" class="panel stack">
@@ -1130,6 +1481,7 @@ app.get("/customers/new", (c) => {
 });
 
 app.post("/customers", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const form = await c.req.parseBody();
 	const customerId = newId("cus");
 	const siteId = newId("sit");
@@ -1160,6 +1512,12 @@ app.post("/customers", async (c) => {
 });
 
 app.get("/customers/:id", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Customer directory is for owner / dispatcher."),
+			403,
+		);
+	}
 	const id = c.req.param("id");
 	const customer = await c.env.DB.prepare(
 		`SELECT * FROM customers WHERE id = ?`,
@@ -1302,6 +1660,7 @@ app.get("/customers/:id", async (c) => {
 });
 
 app.post("/customers/:id/portal", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const id = c.req.param("id");
 	const customer = await c.env.DB.prepare(
 		`SELECT id FROM customers WHERE id = ?`,
@@ -1322,6 +1681,7 @@ app.post("/customers/:id/portal", async (c) => {
 });
 
 app.post("/customers/:id/portal/:tokenId/revoke", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const id = c.req.param("id");
 	const tokenId = c.req.param("tokenId");
 	await revokePortalToken(c.env.DB, tokenId, id);
@@ -1329,12 +1689,25 @@ app.post("/customers/:id/portal/:tokenId/revoke", async (c) => {
 });
 
 app.get("/leads", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Lead pipeline is for owner / dispatcher."),
+			403,
+		);
+	}
 	const product = c.req.query("product") || "";
 	const tech = c.req.query("tech") || "";
 	const stage = c.req.query("stage") || ""; // lead | estimate | ""
 
 	const where: string[] = ["j.status IN ('lead', 'estimate')"];
 	const binds: string[] = [];
+	appendFieldJobListFilters(
+		c.get("user")!,
+		where,
+		binds,
+		RESTORATION_SQL_TYPES,
+		FLOOR_TYPE_VALUES,
+	);
 
 	if (product === "restoration") {
 		where.push(
@@ -1520,6 +1893,7 @@ app.get("/leads", async (c) => {
 });
 
 app.post("/leads/:id/follow-up", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const id = c.req.param("id");
 	const form = await c.req.parseBody();
 	const followUp = String(form.follow_up_at || "").trim() || null;
@@ -1541,6 +1915,7 @@ app.post("/leads/:id/follow-up", async (c) => {
 });
 
 app.post("/leads/:id/schedule", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const id = c.req.param("id");
 	const job = await c.env.DB.prepare(
 		`SELECT id, status FROM jobs WHERE id = ?`,
@@ -1560,14 +1935,26 @@ app.post("/leads/:id/schedule", async (c) => {
 });
 
 app.get("/jobs", async (c) => {
+	const user = c.get("user")!;
 	const status = c.req.query("status") || "";
 	const tech = c.req.query("tech") || "";
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
 	const product = c.req.query("product") || "";
 
+	if (product === "restoration" && !canAccessProduct(user, "restoration")) {
+		return c.html(forbiddenHtml(c, "Your account does not include Restoration."), 403);
+	}
+	if (product === "floors" && !canAccessProduct(user, "floors")) {
+		return c.html(forbiddenHtml(c, "Your account does not include Floors."), 403);
+	}
+	if (!canAccessProduct(user, "restoration") && !canAccessProduct(user, "floors")) {
+		return c.html(forbiddenHtml(c, "Your account has no field products."), 403);
+	}
+
 	const where: string[] = ["1=1"];
 	const binds: string[] = [];
+	appendFieldJobListFilters(user, where, binds, RESTORATION_SQL_TYPES, FLOOR_TYPE_VALUES);
 	if (product === "restoration") {
 		where.push(
 			`j.job_type IN (${RESTORATION_SQL_TYPES.map(() => "?").join(",")})`,
@@ -1741,14 +2128,20 @@ app.get("/jobs", async (c) => {
 });
 
 app.get("/jobs/export.csv", async (c) => {
+	const user = c.get("user")!;
 	const status = c.req.query("status") || "";
 	const tech = c.req.query("tech") || "";
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
 	const product = c.req.query("product") || "";
 
+	if (!canAccessProduct(user, "restoration") && !canAccessProduct(user, "floors")) {
+		return c.text("Forbidden", 403);
+	}
+
 	const where: string[] = ["1=1"];
 	const binds: string[] = [];
+	appendFieldJobListFilters(user, where, binds, RESTORATION_SQL_TYPES, FLOOR_TYPE_VALUES);
 	if (product === "restoration") {
 		where.push(
 			`j.job_type IN (${RESTORATION_SQL_TYPES.map(() => "?").join(",")})`,
@@ -1833,8 +2226,18 @@ app.get("/jobs/export.csv", async (c) => {
 });
 
 app.get("/jobs/new", async (c) => {
+	const user = c.get("user")!;
+	if (!canSeeOfficeTools(user)) {
+		return c.html(forbiddenHtml(c, "Creating jobs is for owner / dispatcher."), 403);
+	}
 	const preselect = c.req.query("customer_id") || "";
 	const product = c.req.query("product") || "";
+	if (product === "restoration" && !canAccessProduct(user, "restoration")) {
+		return c.html(forbiddenHtml(c, "Your account does not include Restoration."), 403);
+	}
+	if (product === "floors" && !canAccessProduct(user, "floors")) {
+		return c.html(forbiddenHtml(c, "Your account does not include Floors."), 403);
+	}
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
@@ -1958,6 +2361,8 @@ app.get("/jobs/new", async (c) => {
 });
 
 app.post("/jobs", async (c) => {
+	const user = c.get("user")!;
+	if (!canSeeOfficeTools(user)) return c.text("Forbidden", 403);
 	const form = await c.req.parseBody();
 	let customerId = String(form.customer_id || "").trim();
 	const newCustomerName = String(form.new_customer_name || "").trim();
@@ -1966,6 +2371,9 @@ app.post("/jobs", async (c) => {
 		return c.text("Invalid job type", 400);
 	}
 	const jobType = normalizeJobType(rawType);
+	if (!jobTypeAllowedForUser(user, jobType)) {
+		return c.text("Your account cannot create this job type", 403);
+	}
 
 	const stmts: D1PreparedStatement[] = [];
 	let siteId: string | null = null;
@@ -2109,6 +2517,22 @@ app.get("/jobs/:id", async (c) => {
 			postal_code: string | null;
 		}>();
 	if (!job) return c.notFound();
+
+	const user = c.get("user")!;
+	const accessJob: FieldJobAccess = {
+		id: job.id,
+		status: job.status,
+		assigned_user_id: job.assigned_user_id,
+		job_type: job.job_type,
+	};
+	const canWrite = canWriteFieldJob(user, accessJob);
+	const lockedBanner = !canWrite
+		? isStatusLocked(job.status)
+			? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This job is locked (complete / invoiced). Field edits are disabled for techs. Owner or dispatcher can change status to reopen.</div>`
+			: `<div class="flash">Read-only — you can view this job but not edit it.</div>`
+		: isStatusLocked(job.status)
+			? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">Job is complete / invoiced. Change status below to reopen before field edits by techs.</div>`
+			: "";
 
 	const staff = await c.env.DB.prepare(
 		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
@@ -2533,6 +2957,7 @@ app.get("/jobs/:id", async (c) => {
 	].join("");
 
 	const body = `
+    ${lockedBanner}
     <div class="toolbar">
       <div class="grow">
         <h1 style="margin:0">${escapeHtml(job.title)}</h1>
@@ -3845,6 +4270,7 @@ app.post("/inventory/:id", async (c) => {
 });
 
 app.get("/reports", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.html(forbiddenHtml(c, "Reports are for owner / dispatcher."), 403);
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
 	const q = new URLSearchParams();
@@ -3894,6 +4320,7 @@ app.get("/reports", async (c) => {
 });
 
 app.get("/reports/jobs.csv", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
 	const where: string[] = ["1=1"];
@@ -3970,6 +4397,7 @@ app.get("/reports/jobs.csv", async (c) => {
 });
 
 app.get("/reports/field-logs.csv", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
 	const where: string[] = ["1=1"];
@@ -4039,6 +4467,7 @@ app.get("/reports/field-logs.csv", async (c) => {
 });
 
 app.get("/reports/inventory.csv", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
 	const where: string[] = ["1=1"];
@@ -4101,6 +4530,7 @@ app.get("/reports/inventory.csv", async (c) => {
 });
 
 app.get("/reports/print.csv", async (c) => {
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
 	const where: string[] = ["1=1"];
@@ -4166,6 +4596,10 @@ app.get("/reports/print.csv", async (c) => {
 });
 
 app.get("/recurring", async (c) => {
+	const _u = c.get("user")!;
+	if (!canSeeOfficeTools(_u) || !canAccessProduct(_u, "floors")) {
+		return c.html(forbiddenHtml(c, "Recurring jobs are for owner / dispatcher with Floors access."), 403);
+	}
 	const list = await c.env.DB.prepare(
 		`SELECT r.*, c.name AS customer_name, u.name AS assignee_name
      FROM recurring_jobs r
@@ -4296,6 +4730,10 @@ app.get("/recurring", async (c) => {
 });
 
 app.post("/recurring", async (c) => {
+	const _u = c.get("user")!;
+	if (!canSeeOfficeTools(_u) || !canAccessProduct(_u, "floors")) {
+		return c.text("Forbidden", 403);
+	}
 	const form = await c.req.parseBody();
 	const customerId = String(form.customer_id || "");
 	const rawType = String(form.job_type || "hard_floor");
@@ -4336,6 +4774,10 @@ app.post("/recurring", async (c) => {
 });
 
 app.post("/recurring/generate", async (c) => {
+	const _u = c.get("user")!;
+	if (!canSeeOfficeTools(_u) || !canAccessProduct(_u, "floors")) {
+		return c.text("Forbidden", 403);
+	}
 	const created = await generateDueRecurringJobs(c.env.DB);
 	return c.html(
 		page(
@@ -4348,6 +4790,10 @@ app.post("/recurring/generate", async (c) => {
 });
 
 app.post("/recurring/:id/toggle", async (c) => {
+	const _u = c.get("user")!;
+	if (!canSeeOfficeTools(_u) || !canAccessProduct(_u, "floors")) {
+		return c.text("Forbidden", 403);
+	}
 	const id = c.req.param("id");
 	await c.env.DB.prepare(
 		`UPDATE recurring_jobs SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END WHERE id = ?`,
@@ -4358,25 +4804,47 @@ app.post("/recurring/:id/toggle", async (c) => {
 });
 
 app.get("/print", async (c) => {
+	if (!canAccessProduct(c.get("user")!, "print")) return c.html(forbiddenHtml(c, "Your account does not include Print Ops."), 403);
+	const user = c.get("user")!;
 	const status = c.req.query("status") || "";
+	const pVis = printJobVisibility(user);
+	const pExtra = pVis.sql === "1=1" ? "" : ` AND ${pVis.sql}`;
 	const list = status
-		? await c.env.DB.prepare(
-				`SELECT p.*, c.name AS customer_name
+		? await (pVis.binds.length
+				? c.env.DB.prepare(
+						`SELECT p.*, c.name AS customer_name
+         FROM print_jobs p
+         LEFT JOIN customers c ON c.id = p.customer_id
+         WHERE p.status = ?${pExtra}
+         ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
+         LIMIT 100`,
+					).bind(status, ...pVis.binds)
+				: c.env.DB.prepare(
+						`SELECT p.*, c.name AS customer_name
          FROM print_jobs p
          LEFT JOIN customers c ON c.id = p.customer_id
          WHERE p.status = ?
          ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
          LIMIT 100`,
-			)
-				.bind(status)
-				.all()
-		: await c.env.DB.prepare(
-				`SELECT p.*, c.name AS customer_name
+					).bind(status)
+			).all()
+		: await (pVis.binds.length
+				? c.env.DB.prepare(
+						`SELECT p.*, c.name AS customer_name
+         FROM print_jobs p
+         LEFT JOIN customers c ON c.id = p.customer_id
+         WHERE p.status != 'cancelled'${pExtra}
+         ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
+         LIMIT 100`,
+					).bind(...pVis.binds)
+				: c.env.DB.prepare(
+						`SELECT p.*, c.name AS customer_name
          FROM print_jobs p
          LEFT JOIN customers c ON c.id = p.customer_id
          WHERE p.status != 'cancelled'
          ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
          LIMIT 100`,
+					)
 			).all();
 
 	const rows =
@@ -4431,14 +4899,29 @@ app.get("/print", async (c) => {
 });
 
 app.get("/print/board", async (c) => {
-	const list = await c.env.DB.prepare(
-		`SELECT p.id, p.title, p.product_type, p.status, p.quantity, p.due_date, p.revise_count,
+	if (!canAccessProduct(c.get("user")!, "print")) return c.html(forbiddenHtml(c, "Your account does not include Print Ops."), 403);
+	const user = c.get("user")!;
+	const pVis = printJobVisibility(user);
+	const pExtra = pVis.sql === "1=1" ? "" : ` AND ${pVis.sql}`;
+	const list = await (pVis.binds.length
+		? c.env.DB.prepare(
+				`SELECT p.id, p.title, p.product_type, p.status, p.quantity, p.due_date, p.revise_count,
+      c.name AS customer_name
+     FROM print_jobs p
+     LEFT JOIN customers c ON c.id = p.customer_id
+     WHERE p.status IN ('intake','proof','approved','in_production','ready')${pExtra}
+     ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
+     LIMIT 200`,
+			).bind(...pVis.binds)
+		: c.env.DB.prepare(
+				`SELECT p.id, p.title, p.product_type, p.status, p.quantity, p.due_date, p.revise_count,
       c.name AS customer_name
      FROM print_jobs p
      LEFT JOIN customers c ON c.id = p.customer_id
      WHERE p.status IN ('intake','proof','approved','in_production','ready')
      ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
      LIMIT 200`,
+			)
 	).all<{
 		id: string;
 		title: string;
@@ -4490,6 +4973,8 @@ app.get("/print/board", async (c) => {
 });
 
 app.get("/print/new", async (c) => {
+	if (!canAccessProduct(c.get("user")!, "print")) return c.html(forbiddenHtml(c, "Your account does not include Print Ops."), 403);
+	if (!canSeeOfficeTools(c.get("user")!)) return c.html(forbiddenHtml(c, "Creating print jobs is for owner / dispatcher."), 403);
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
@@ -4561,6 +5046,8 @@ app.get("/print/new", async (c) => {
 });
 
 app.post("/print", async (c) => {
+	if (!canAccessProduct(c.get("user")!, "print")) return c.text("Forbidden", 403);
+	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const form = await c.req.parseBody();
 	const productType = String(form.product_type || "");
 	if (!PRINT_PRODUCT_TYPES.some((p) => p.value === productType)) {
@@ -5212,13 +5699,28 @@ app.get("/tech", async (c) => {
 });
 
 app.get("/calendar", async (c) => {
-	const jobs = await c.env.DB.prepare(
-		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, j.scheduled_end, c.name AS customer_name
+	const user = c.get("user")!;
+	const where: string[] = [
+		"j.scheduled_start IS NOT NULL",
+		"j.status NOT IN ('cancelled')",
+	];
+	const binds: string[] = [];
+	appendFieldJobListFilters(user, where, binds, RESTORATION_SQL_TYPES, FLOOR_TYPE_VALUES);
+	const jobs = await (binds.length
+		? c.env.DB.prepare(
+				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, j.scheduled_end, c.name AS customer_name
      FROM jobs j JOIN customers c ON c.id = j.customer_id
-     WHERE j.scheduled_start IS NOT NULL
-       AND j.status NOT IN ('cancelled')
+     WHERE ${where.join(" AND ")}
      ORDER BY j.scheduled_start ASC
      LIMIT 60`,
+			).bind(...binds)
+		: c.env.DB.prepare(
+				`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, j.scheduled_end, c.name AS customer_name
+     FROM jobs j JOIN customers c ON c.id = j.customer_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY j.scheduled_start ASC
+     LIMIT 60`,
+			)
 	).all<{
 		id: string;
 		title: string;

@@ -82,6 +82,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] Moisture map image uploads (2D)
 - [x] Tech day list polish (`/tech`)
 - [x] Portal estimate accept
+- [x] RBAC slice: product scopes on users, tech assignment RLS, status lock (complete/invoiced; print delivered), server-side enforcement
 
 ## Phase 6 — Multi-brand
 

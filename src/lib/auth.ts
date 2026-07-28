@@ -3,6 +3,8 @@ import { setCookie, deleteCookie } from "hono/cookie";
 import { newId } from "./ids";
 import { hashPassword } from "./password";
 import type { PermissionRole } from "./roles";
+import type { ProductKey } from "./products";
+import { parseProducts } from "./access";
 
 export type AppUser = {
 	id: string;
@@ -10,6 +12,7 @@ export type AppUser = {
 	name: string;
 	role: PermissionRole;
 	designation: string;
+	products: ProductKey[];
 	mustChangePassword: boolean;
 };
 
@@ -74,6 +77,7 @@ export async function getSessionUser(
 		.prepare(
 			`SELECT u.id, u.email, u.name, u.role,
         COALESCE(u.designation, u.role) AS designation,
+        u.products,
         u.must_change_password, s.expires_at
      FROM sessions s
      JOIN users u ON u.id = s.user_id
@@ -86,6 +90,7 @@ export async function getSessionUser(
 			name: string;
 			role: string;
 			designation: string;
+			products: string | null;
 			must_change_password: number;
 			expires_at: string;
 		}>();
@@ -105,6 +110,7 @@ export async function getSessionUser(
 		name: row.name,
 		role: permissionRole,
 		designation: row.designation || permissionRole,
+		products: parseProducts(row.products),
 		mustChangePassword: row.must_change_password === 1,
 	};
 }

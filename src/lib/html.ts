@@ -1,5 +1,10 @@
 import type { AppUser } from "./auth";
 import { roleLabel } from "./roles";
+import {
+	canAccessProduct,
+	canManageUsers,
+	canSeeOfficeTools,
+} from "./access";
 
 export function escapeHtml(value: string | number | null | undefined): string {
 	return String(value ?? "")
@@ -21,25 +26,37 @@ export function layout(opts: {
 	body: string;
 	flash?: string | null;
 }): string {
-	const items: Array<{ href: string; label: string }> = opts.user
-		? [
-				{ href: "/", label: "Home" },
-				{ href: "/restoration", label: "Restoration" },
-				{ href: "/floors", label: "Floors" },
-				{ href: "/print", label: "Print" },
-				{ href: "/customers", label: "Customers" },
-				{ href: "/leads", label: "Leads" },
-				{ href: "/calendar", label: "Calendar" },
-			]
-		: [];
-	if (opts.user?.role === "owner") {
-		items.push({ href: "/users", label: "Users" });
-	}
-	if (opts.user) {
+	const u = opts.user;
+	const items: Array<{ href: string; label: string }> = [];
+	if (u) {
+		items.push({ href: "/", label: "Home" });
+		if (canAccessProduct(u, "restoration")) {
+			items.push({ href: "/restoration", label: "Restoration" });
+		}
+		if (canAccessProduct(u, "floors")) {
+			items.push({ href: "/floors", label: "Floors" });
+		}
+		if (canAccessProduct(u, "print")) {
+			items.push({ href: "/print", label: "Print" });
+		}
+		if (canSeeOfficeTools(u)) {
+			items.push({ href: "/customers", label: "Customers" });
+			items.push({ href: "/leads", label: "Leads" });
+		}
+		items.push({ href: "/calendar", label: "Calendar" });
+		if (canManageUsers(u)) {
+			items.push({ href: "/users", label: "Users" });
+		}
 		items.push({ href: "/inventory", label: "Inventory" });
-		items.push({ href: "/reports", label: "Reports" });
-		items.push({ href: "/recurring", label: "Recurring" });
-		items.push({ href: "/print/board", label: "Press board" });
+		if (canSeeOfficeTools(u)) {
+			items.push({ href: "/reports", label: "Reports" });
+		}
+		if (canAccessProduct(u, "floors") && canSeeOfficeTools(u)) {
+			items.push({ href: "/recurring", label: "Recurring" });
+		}
+		if (canAccessProduct(u, "print")) {
+			items.push({ href: "/print/board", label: "Press board" });
+		}
 		items.push({ href: "/tech", label: "Tech" });
 	}
 
