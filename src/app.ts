@@ -327,7 +327,7 @@ app.get("/portal/jobs/:id", async (c) => {
 	const id = c.req.param("id");
 	const job = await c.env.DB.prepare(
 		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, j.scheduled_end,
-      j.claim_number, j.carrier, j.date_of_loss, j.notes,
+      j.claim_number, j.carrier, j.date_of_loss, j.notes, j.estimate_cents, j.estimate_accepted_at,
       s.address_line1, s.city, s.state, s.postal_code
      FROM jobs j
      LEFT JOIN sites s ON s.id = j.site_id
@@ -345,6 +345,8 @@ app.get("/portal/jobs/:id", async (c) => {
 			carrier: string | null;
 			date_of_loss: string | null;
 			notes: string | null;
+			estimate_cents: number | null;
+			estimate_accepted_at: string | null;
 			address_line1: string | null;
 			city: string | null;
 			state: string | null;
@@ -427,6 +429,29 @@ app.get("/portal/jobs/:id", async (c) => {
 				? `<h2>Moisture readings</h2><p class="muted">No readings logged yet.</p>`
 				: "";
 
+	const canAcceptEstimate =
+		!job.estimate_accepted_at &&
+		(job.status === "estimate" ||
+			(job.status === "lead" && job.estimate_cents != null && job.estimate_cents > 0));
+
+	const acceptSection = job.estimate_accepted_at
+		? `<div class="panel" style="margin-top:1rem">
+      <strong>Estimate accepted</strong>
+      <p class="muted" style="margin:0.35rem 0 0">Accepted on ${escapeHtml(job.estimate_accepted_at.slice(0, 16).replace("T", " "))} UTC.</p>
+    </div>`
+		: canAcceptEstimate
+			? `<div class="panel stack" style="margin-top:1rem">
+      <div><span class="muted">Estimate</span><br><strong>${escapeHtml(money(job.estimate_cents))}</strong></div>
+      <p class="muted" style="margin:0">Accepting moves this job to scheduled so Timla can proceed.</p>
+      <form method="post" action="/portal/jobs/${escapeHtml(id)}/accept-estimate"
+        onsubmit="return confirm('Accept this estimate and schedule the work?');">
+        <button class="btn" type="submit">Accept estimate</button>
+      </form>
+    </div>`
+			: job.estimate_cents != null
+				? `<div class="panel" style="margin-top:1rem"><span class="muted">Estimate</span><br>${escapeHtml(money(job.estimate_cents))}</div>`
+				: "";
+
 	const body = `
     <p><a href="/portal/jobs">← All jobs</a></p>
     <h1>${escapeHtml(job.title)}</h1>
@@ -445,11 +470,56 @@ app.get("/portal/jobs/:id", async (c) => {
       ${job.date_of_loss ? `<div><span class="muted">Date of loss</span><br>${escapeHtml(job.date_of_loss)}</div>` : ""}
       ${job.notes ? `<div><span class="muted">Job notes</span><br>${escapeHtml(job.notes)}</div>` : ""}
     </div>
+    ${acceptSection}
     ${moistureSection}
     <h2>Recent notes</h2>
     <div class="stack">${noteItems}</div>`;
 
 	return c.html(portalPage(job.title, customer, body));
+});
+
+app.post("/portal/jobs/:id/accept-estimate", async (c) => {
+	const customer =
+		c.get("portalCustomer") ||
+		(await getPortalCustomer(c.env.DB, getCookie(c, PORTAL_COOKIE)));
+	if (!customer) return c.redirect("/portal/enter");
+
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT id, status, estimate_cents, estimate_accepted_at
+     FROM jobs WHERE id = ? AND customer_id = ?`,
+	)
+		.bind(id, customer.id)
+		.first<{
+			id: string;
+			status: string;
+			estimate_cents: number | null;
+			estimate_accepted_at: string | null;
+		}>();
+	if (!job) return c.notFound();
+	if (job.estimate_accepted_at) {
+		return c.redirect(`/portal/jobs/${id}`);
+	}
+	const allowed =
+		job.status === "estimate" ||
+		(job.status === "lead" &&
+			job.estimate_cents != null &&
+			job.estimate_cents > 0);
+	if (!allowed) {
+		return c.text("This estimate cannot be accepted in its current status.", 400);
+	}
+
+	await c.env.DB.prepare(
+		`UPDATE jobs SET
+      estimate_accepted_at = datetime('now'),
+      status = 'scheduled',
+      updated_at = datetime('now')
+     WHERE id = ? AND customer_id = ?`,
+	)
+		.bind(id, customer.id)
+		.run();
+
+	return c.redirect(`/portal/jobs/${id}`);
 });
 
 app.get("/login", async (c) => {
@@ -2027,6 +2097,7 @@ app.get("/jobs/:id", async (c) => {
 			date_of_loss: string | null;
 			lead_source: string | null;
 			follow_up_at: string | null;
+			estimate_accepted_at: string | null;
 			customer_id: string;
 			customer_name: string;
 			assigned_user_id: string | null;
@@ -2496,6 +2567,11 @@ app.get("/jobs/:id", async (c) => {
           ${job.scheduled_end ? ` → ${escapeHtml(job.scheduled_end.slice(0, 16).replace("T", " "))}` : ""}
         </div>
         <div><span class="muted">Estimate</span><br>${escapeHtml(money(job.estimate_cents))} <a href="/jobs/${escapeHtml(id)}/estimate">edit lines</a></div>
+        <div><span class="muted">Estimate accepted</span><br>${
+					job.estimate_accepted_at
+						? escapeHtml(job.estimate_accepted_at.slice(0, 16).replace("T", " "))
+						: "—"
+				}</div>
         <div><span class="muted">Job cost</span><br>${escapeHtml(money(costTotal))} · margin ${jobMargin == null ? "—" : escapeHtml(money(jobMargin))}</div>
         <div><span class="muted">Invoice</span><br>${escapeHtml(money(job.invoice_cents))}</div>
         <div><span class="muted">Claim #</span><br>${escapeHtml(job.claim_number) || "—"}</div>
