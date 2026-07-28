@@ -76,6 +76,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 
 - [x] Lead pipeline (`/leads`, source + follow-up)
 - [x] Job cost tracking (labor / materials / equipment days)
+- [x] Drying pack / water-loss PDF (psychrometric fields + S500-style docs)
 
 ## Phase 6 — Multi-brand
 

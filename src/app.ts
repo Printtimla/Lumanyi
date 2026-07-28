@@ -91,6 +91,7 @@ import {
 	marginCents,
 	sumCostCents,
 } from "./lib/job-costs";
+import { buildWaterLossPdf, parseOptionalNumber } from "./lib/water-loss";
 
 const RESTORATION_SQL_TYPES = [
 	...RESTORATION_TYPES.map((t) => t.value),
@@ -358,7 +359,7 @@ app.get("/portal/jobs/:id", async (c) => {
 
 	const moisture = isRestorationType(job.job_type)
 		? await c.env.DB.prepare(
-				`SELECT logged_at, area, reading, notes FROM job_field_logs
+				`SELECT logged_at, area, reading, temp_f, rh_pct, grains, notes FROM job_field_logs
          WHERE job_id = ? AND kind = 'moisture'
          ORDER BY logged_at DESC LIMIT 20`,
 			)
@@ -367,14 +368,22 @@ app.get("/portal/jobs/:id", async (c) => {
 					logged_at: string;
 					area: string | null;
 					reading: string | null;
+					temp_f: number | null;
+					rh_pct: number | null;
+					grains: number | null;
 					notes: string | null;
 				}>()
-		: { results: [] as Array<{
-				logged_at: string;
-				area: string | null;
-				reading: string | null;
-				notes: string | null;
-			}> };
+		: {
+				results: [] as Array<{
+					logged_at: string;
+					area: string | null;
+					reading: string | null;
+					temp_f: number | null;
+					rh_pct: number | null;
+					grains: number | null;
+					notes: string | null;
+				}>,
+			};
 
 	const noteItems =
 		notes.results
@@ -388,21 +397,29 @@ app.get("/portal/jobs/:id", async (c) => {
 
 	const moistureRows =
 		moisture.results
-			?.map(
-				(m) => `<tr>
+			?.map((m) => {
+				const ambient = [
+					m.temp_f != null ? `${m.temp_f}°F` : null,
+					m.rh_pct != null ? `${m.rh_pct}%` : null,
+					m.grains != null ? `${m.grains} gpp` : null,
+				]
+					.filter(Boolean)
+					.join(" · ");
+				return `<tr>
         <td>${escapeHtml(m.logged_at.slice(0, 10))}</td>
         <td>${escapeHtml(m.area) || "—"}</td>
         <td>${escapeHtml(m.reading) || "—"}</td>
+        <td>${escapeHtml(ambient) || "—"}</td>
         <td>${escapeHtml(m.notes) || "—"}</td>
-      </tr>`,
-			)
+      </tr>`;
+			})
 			.join("") || "";
 
 	const moistureSection =
 		isRestorationType(job.job_type) && moistureRows
 			? `<h2>Moisture readings</h2>
     <table>
-      <thead><tr><th>Date</th><th>Area</th><th>Reading</th><th>Notes</th></tr></thead>
+      <thead><tr><th>Date</th><th>Area</th><th>Reading</th><th>Ambient</th><th>Notes</th></tr></thead>
       <tbody>${moistureRows}</tbody>
     </table>`
 			: isRestorationType(job.job_type)
@@ -1957,8 +1974,8 @@ app.get("/jobs/:id", async (c) => {
 	let fieldLogSection = "";
 	if (isRestoration) {
 		const logs = await c.env.DB.prepare(
-			`SELECT l.id, l.kind, l.logged_at, l.area, l.reading, l.equipment_type,
-        l.equipment_count, l.notes, l.created_at, u.name AS user_name
+			`SELECT l.id, l.kind, l.logged_at, l.area, l.reading, l.temp_f, l.rh_pct, l.grains,
+        l.equipment_type, l.equipment_count, l.notes, l.created_at, u.name AS user_name
        FROM job_field_logs l
        LEFT JOIN users u ON u.id = l.created_by
        WHERE l.job_id = ?
@@ -1976,11 +1993,19 @@ app.get("/jobs/:id", async (c) => {
 		const moistureRows =
 			logs.results
 				?.filter((l) => l.kind === "moisture")
-				.map(
-					(l) => `<tr>
+				.map((l) => {
+					const psycho = [
+						l.temp_f != null ? `${l.temp_f}°F` : null,
+						l.rh_pct != null ? `${l.rh_pct}%` : null,
+						l.grains != null ? `${l.grains} gpp` : null,
+					]
+						.filter(Boolean)
+						.join(" · ");
+					return `<tr>
             <td>${escapeHtml(l.logged_at.slice(0, 10))}</td>
             <td>${escapeHtml(l.area) || "—"}</td>
             <td>${escapeHtml(l.reading) || "—"}</td>
+            <td>${escapeHtml(psycho) || "—"}</td>
             <td>${escapeHtml(l.notes) || "—"}</td>
             <td class="muted">${escapeHtml(l.user_name) || "—"}</td>
             <td>
@@ -1989,10 +2014,10 @@ app.get("/jobs/:id", async (c) => {
                 <button class="linkish" type="submit">Delete</button>
               </form>
             </td>
-          </tr>`,
-				)
+          </tr>`;
+				})
 				.join("") ||
-			`<tr><td colspan="6" class="muted">No moisture readings yet.</td></tr>`;
+			`<tr><td colspan="7" class="muted">No moisture readings yet.</td></tr>`;
 
 		const equipmentRows =
 			logs.results
@@ -2018,22 +2043,31 @@ app.get("/jobs/:id", async (c) => {
 
 		fieldLogSection = `
     <h2>Moisture readings</h2>
-    <p class="muted">Restoration jobs only — room/area readings over time.</p>
+    <p class="muted">Restoration jobs — material readings plus optional ambient psychrometrics (temp, RH, grains). Supports IICRC S500-style drying records; not a certification of compliance.
+      <a href="/jobs/${escapeHtml(id)}/water-loss.pdf">Download water-loss PDF</a></p>
     <form method="post" action="/jobs/${escapeHtml(id)}/logs/moisture" class="panel stack" style="margin-bottom:1rem">
       <div class="row">
         <div><label for="m_logged_at">Date</label>
           <input id="m_logged_at" name="logged_at" type="date" required value="${escapeHtml(today)}" /></div>
         <div><label for="m_area">Room / area</label>
           <input id="m_area" name="area" required placeholder="Kitchen — NW wall" /></div>
-        <div><label for="m_reading">Reading</label>
+        <div><label for="m_reading">Material reading</label>
           <input id="m_reading" name="reading" required placeholder="18% or 0.45" /></div>
       </div>
+      <div class="row">
+        <div><label for="m_temp_f">Temp (°F)</label>
+          <input id="m_temp_f" name="temp_f" type="number" step="0.1" placeholder="optional" /></div>
+        <div><label for="m_rh_pct">RH (%)</label>
+          <input id="m_rh_pct" name="rh_pct" type="number" step="0.1" min="0" max="100" placeholder="optional" /></div>
+        <div><label for="m_grains">Grains (GPP)</label>
+          <input id="m_grains" name="grains" type="number" step="0.1" min="0" placeholder="optional" /></div>
+      </div>
       <div><label for="m_notes">Notes</label>
-        <input id="m_notes" name="notes" placeholder="Meter, material, ambient RH…" /></div>
+        <input id="m_notes" name="notes" placeholder="Meter, material, class of water…" /></div>
       <button class="btn" type="submit">Add moisture reading</button>
     </form>
     <table>
-      <thead><tr><th>Date</th><th>Area</th><th>Reading</th><th>Notes</th><th>By</th><th></th></tr></thead>
+      <thead><tr><th>Date</th><th>Area</th><th>Reading</th><th>Ambient</th><th>Notes</th><th>By</th><th></th></tr></thead>
       <tbody>${moistureRows}</tbody>
     </table>
 
@@ -2253,6 +2287,7 @@ app.get("/jobs/:id", async (c) => {
       </div>
       <a class="btn secondary" href="/jobs/${escapeHtml(id)}/estimate">Estimate</a>
       <a class="btn secondary" href="/jobs/${escapeHtml(id)}/estimate.pdf">PDF</a>
+      ${isRestoration ? `<a class="btn secondary" href="/jobs/${escapeHtml(id)}/water-loss.pdf">Water-loss PDF</a>` : ""}
     </div>
 
     <div class="row" style="margin-top:1rem">
@@ -2516,8 +2551,8 @@ app.post("/jobs/:id/logs/moisture", async (c) => {
 
 	await c.env.DB.prepare(
 		`INSERT INTO job_field_logs (
-      id, job_id, kind, logged_at, area, reading, notes, created_by
-    ) VALUES (?, ?, 'moisture', ?, ?, ?, ?, ?)`,
+      id, job_id, kind, logged_at, area, reading, temp_f, rh_pct, grains, notes, created_by
+    ) VALUES (?, ?, 'moisture', ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 		.bind(
 			newId("flog"),
@@ -2525,6 +2560,9 @@ app.post("/jobs/:id/logs/moisture", async (c) => {
 			loggedAt,
 			area,
 			reading,
+			parseOptionalNumber(form.temp_f),
+			parseOptionalNumber(form.rh_pct),
+			parseOptionalNumber(form.grains),
 			String(form.notes || "").trim() || null,
 			c.get("user")!.id,
 		)
@@ -2934,6 +2972,111 @@ app.get("/jobs/:id/estimate.pdf", async (c) => {
 		headers: {
 			"Content-Type": "application/pdf",
 			"Content-Disposition": `attachment; filename="estimate-${id}.pdf"`,
+		},
+	});
+});
+
+app.get("/jobs/:id/water-loss.pdf", async (c) => {
+	const id = c.req.param("id");
+	const gate = await requireRestorationJob(c.env.DB, id);
+	if (gate instanceof Response) return gate;
+
+	const job = await c.env.DB.prepare(
+		`SELECT j.title, j.job_type, j.status, j.notes, j.claim_number, j.carrier, j.date_of_loss,
+      c.name AS customer_name,
+      s.address_line1, s.city, s.state, s.postal_code
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN sites s ON s.id = j.site_id
+     WHERE j.id = ?`,
+	)
+		.bind(id)
+		.first<{
+			title: string;
+			job_type: string;
+			status: string;
+			notes: string | null;
+			claim_number: string | null;
+			carrier: string | null;
+			date_of_loss: string | null;
+			customer_name: string;
+			address_line1: string | null;
+			city: string | null;
+			state: string | null;
+			postal_code: string | null;
+		}>();
+	if (!job) return c.notFound();
+
+	const logs = await c.env.DB.prepare(
+		`SELECT kind, logged_at, area, reading, temp_f, rh_pct, grains,
+      equipment_type, equipment_count, notes
+     FROM job_field_logs WHERE job_id = ?
+     ORDER BY logged_at ASC, created_at ASC`,
+	)
+		.bind(id)
+		.all<{
+			kind: string;
+			logged_at: string;
+			area: string | null;
+			reading: string | null;
+			temp_f: number | null;
+			rh_pct: number | null;
+			grains: number | null;
+			equipment_type: string | null;
+			equipment_count: number | null;
+			notes: string | null;
+		}>();
+
+	const fieldNotes = await c.env.DB.prepare(
+		`SELECT n.body, n.created_at, u.name AS user_name
+     FROM job_notes n LEFT JOIN users u ON u.id = n.user_id
+     WHERE n.job_id = ? ORDER BY n.created_at DESC LIMIT 20`,
+	)
+		.bind(id)
+		.all<{ body: string; created_at: string; user_name: string | null }>();
+
+	const siteLine = job.address_line1
+		? `${job.address_line1}, ${job.city}, ${job.state} ${job.postal_code || ""}`.trim()
+		: "";
+
+	const all = logs.results || [];
+	const bytes = await buildWaterLossPdf({
+		jobTitle: job.title,
+		jobTypeLabel: jobTypeLabel(job.job_type),
+		customerName: job.customer_name,
+		siteLine,
+		claimNumber: job.claim_number,
+		carrier: job.carrier,
+		dateOfLoss: job.date_of_loss,
+		status: statusLabel(job.status),
+		jobNotes: job.notes,
+		moisture: all
+			.filter((l) => l.kind === "moisture")
+			.map((l) => ({
+				logged_at: l.logged_at,
+				area: l.area,
+				reading: l.reading,
+				temp_f: l.temp_f,
+				rh_pct: l.rh_pct,
+				grains: l.grains,
+				notes: l.notes,
+			})),
+		equipment: all
+			.filter((l) => l.kind === "equipment")
+			.map((l) => ({
+				logged_at: l.logged_at,
+				area: l.area,
+				equipment_type: l.equipment_type,
+				equipment_count: l.equipment_count,
+				notes: l.notes,
+			})),
+		fieldNotes: fieldNotes.results || [],
+	});
+
+	return new Response(bytes, {
+		headers: {
+			"Content-Type": "application/pdf",
+			"Content-Disposition": `attachment; filename="water-loss-${id}.pdf"`,
 		},
 	});
 });

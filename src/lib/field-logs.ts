@@ -22,6 +22,9 @@ export type FieldLogRow = {
 	logged_at: string;
 	area: string | null;
 	reading: string | null;
+	temp_f: number | null;
+	rh_pct: number | null;
+	grains: number | null;
 	equipment_type: string | null;
 	equipment_count: number | null;
 	notes: string | null;
