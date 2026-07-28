@@ -68,7 +68,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 ## Later — Field depth
 
 - [x] Moisture / equipment logs on restoration jobs
-- [ ] Inventory / equipment tracking
+- [x] Inventory / equipment tracking
 - [ ] Reporting / CSV depth
 - [ ] Client portal (optional)
 

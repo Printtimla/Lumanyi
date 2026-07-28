@@ -54,6 +54,13 @@ import {
 	equipmentTypeLabel,
 	type FieldLogRow,
 } from "./lib/field-logs";
+import {
+	ASSET_STATUSES,
+	assetStatusLabel,
+	isValidAssetStatus,
+	isValidEquipmentType,
+	type AssetRow,
+} from "./lib/inventory";
 
 const RESTORATION_SQL_TYPES = [
 	...RESTORATION_TYPES.map((t) => t.value),
@@ -1420,6 +1427,82 @@ app.get("/jobs/:id", async (c) => {
       <thead><tr><th>Date</th><th>Area</th><th>Type</th><th>Count</th><th>Notes</th><th>By</th><th></th></tr></thead>
       <tbody>${equipmentRows}</tbody>
     </table>`;
+
+		const assigned = await c.env.DB.prepare(
+			`SELECT je.id AS assignment_id, a.id AS asset_id, a.label, a.equipment_type, a.serial, je.assigned_at
+       FROM job_equipment je
+       JOIN equipment_assets a ON a.id = je.asset_id
+       WHERE je.job_id = ? AND je.returned_at IS NULL
+       ORDER BY je.assigned_at DESC`,
+		)
+			.bind(id)
+			.all<{
+				assignment_id: string;
+				asset_id: string;
+				label: string;
+				equipment_type: string;
+				serial: string | null;
+				assigned_at: string;
+			}>();
+
+		const available = await c.env.DB.prepare(
+			`SELECT id, label, equipment_type, serial FROM equipment_assets
+       WHERE status = 'available'
+       ORDER BY equipment_type, label COLLATE NOCASE`,
+		).all<{
+			id: string;
+			label: string;
+			equipment_type: string;
+			serial: string | null;
+		}>();
+
+		const assignedRows =
+			assigned.results
+				?.map(
+					(a) => `<tr>
+            <td>${escapeHtml(a.label)}</td>
+            <td>${escapeHtml(equipmentTypeLabel(a.equipment_type))}</td>
+            <td>${escapeHtml(a.serial) || "—"}</td>
+            <td>${escapeHtml(a.assigned_at.slice(0, 16).replace("T", " "))}</td>
+            <td>
+              <form method="post" action="/jobs/${escapeHtml(id)}/inventory/${escapeHtml(a.assignment_id)}/return" class="inline">
+                <button class="linkish" type="submit">Return</button>
+              </form>
+            </td>
+          </tr>`,
+				)
+				.join("") ||
+			`<tr><td colspan="5" class="muted">No inventory units assigned.</td></tr>`;
+
+		const availableOptions =
+			available.results
+				?.map(
+					(a) =>
+						`<option value="${escapeHtml(a.id)}">${escapeHtml(a.label)} · ${escapeHtml(equipmentTypeLabel(a.equipment_type))}${a.serial ? ` · ${escapeHtml(a.serial)}` : ""}</option>`,
+				)
+				.join("") || "";
+
+		fieldLogSection += `
+    <h2>Inventory on this job</h2>
+    <p class="muted">Assign tracked units from <a href="/inventory">Inventory</a>. Count-based log above stays for bulk notes.</p>
+    ${
+			availableOptions
+				? `<form method="post" action="/jobs/${escapeHtml(id)}/inventory" class="panel toolbar" style="align-items:end;margin-bottom:1rem">
+      <div class="grow">
+        <label for="asset_id">Available unit</label>
+        <select id="asset_id" name="asset_id" required>
+          <option value="">Select…</option>
+          ${availableOptions}
+        </select>
+      </div>
+      <button class="btn" type="submit">Assign to job</button>
+    </form>`
+				: `<p class="muted">No available units. <a href="/inventory">Add inventory</a> first.</p>`
+		}
+    <table>
+      <thead><tr><th>Unit</th><th>Type</th><th>Serial</th><th>Assigned</th><th></th></tr></thead>
+      <tbody>${assignedRows}</tbody>
+    </table>`;
 	}
 
 	const statusOptions = [
@@ -2168,6 +2251,278 @@ app.post("/jobs/:id/photos/:photoId/delete", async (c) => {
 		.bind(photoId, id)
 		.run();
 	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/inventory", async (c) => {
+	const id = c.req.param("id");
+	const gate = await requireRestorationJob(c.env.DB, id);
+	if (gate instanceof Response) return gate;
+
+	const form = await c.req.parseBody();
+	const assetId = String(form.asset_id || "").trim();
+	if (!assetId) return c.text("Select a unit", 400);
+
+	const asset = await c.env.DB.prepare(
+		`SELECT id, status FROM equipment_assets WHERE id = ?`,
+	)
+		.bind(assetId)
+		.first<{ id: string; status: string }>();
+	if (!asset || asset.status !== "available") {
+		return c.text("Unit is not available", 400);
+	}
+
+	await c.env.DB.batch([
+		c.env.DB.prepare(
+			`INSERT INTO job_equipment (id, job_id, asset_id) VALUES (?, ?, ?)`,
+		).bind(newId("jeq"), id, assetId),
+		c.env.DB.prepare(
+			`UPDATE equipment_assets SET status = 'on_job', updated_at = datetime('now') WHERE id = ?`,
+		).bind(assetId),
+		c.env.DB.prepare(
+			`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
+		).bind(id),
+	]);
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/inventory/:assignmentId/return", async (c) => {
+	const id = c.req.param("id");
+	const assignmentId = c.req.param("assignmentId");
+	const gate = await requireRestorationJob(c.env.DB, id);
+	if (gate instanceof Response) return gate;
+
+	const row = await c.env.DB.prepare(
+		`SELECT asset_id FROM job_equipment
+     WHERE id = ? AND job_id = ? AND returned_at IS NULL`,
+	)
+		.bind(assignmentId, id)
+		.first<{ asset_id: string }>();
+	if (!row) return c.text("Assignment not found", 404);
+
+	await c.env.DB.batch([
+		c.env.DB.prepare(
+			`UPDATE job_equipment SET returned_at = datetime('now') WHERE id = ?`,
+		).bind(assignmentId),
+		c.env.DB.prepare(
+			`UPDATE equipment_assets SET status = 'available', updated_at = datetime('now') WHERE id = ?`,
+		).bind(row.asset_id),
+	]);
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.get("/inventory", async (c) => {
+	const status = c.req.query("status") || "";
+	const list = status
+		? await c.env.DB.prepare(
+				`SELECT a.*,
+          (SELECT j.title FROM job_equipment je
+           JOIN jobs j ON j.id = je.job_id
+           WHERE je.asset_id = a.id AND je.returned_at IS NULL
+           LIMIT 1) AS job_title,
+          (SELECT je.job_id FROM job_equipment je
+           WHERE je.asset_id = a.id AND je.returned_at IS NULL
+           LIMIT 1) AS job_id
+         FROM equipment_assets a
+         WHERE a.status = ?
+         ORDER BY a.equipment_type, a.label COLLATE NOCASE`,
+			)
+				.bind(status)
+				.all<
+					AssetRow & { job_title: string | null; job_id: string | null }
+				>()
+		: await c.env.DB.prepare(
+				`SELECT a.*,
+          (SELECT j.title FROM job_equipment je
+           JOIN jobs j ON j.id = je.job_id
+           WHERE je.asset_id = a.id AND je.returned_at IS NULL
+           LIMIT 1) AS job_title,
+          (SELECT je.job_id FROM job_equipment je
+           WHERE je.asset_id = a.id AND je.returned_at IS NULL
+           LIMIT 1) AS job_id
+         FROM equipment_assets a
+         ORDER BY a.status, a.equipment_type, a.label COLLATE NOCASE`,
+			).all<AssetRow & { job_title: string | null; job_id: string | null }>();
+
+	const typeOptions = EQUIPMENT_TYPES.map(
+		(t) =>
+			`<option value="${escapeHtml(t.value)}">${escapeHtml(t.label)}</option>`,
+	).join("");
+	const statusFilters = ["", ...ASSET_STATUSES.map((s) => s.value)]
+		.map((s) => {
+			const href = s ? `/inventory?status=${escapeHtml(s)}` : "/inventory";
+			const active = status === s ? "btn" : "btn secondary";
+			return `<a class="${active}" href="${href}">${escapeHtml(s ? assetStatusLabel(s) : "All")}</a>`;
+		})
+		.join(" ");
+
+	const rows =
+		list.results
+			?.map((a) => {
+				const jobCell = a.job_id
+					? `<a href="/jobs/${escapeHtml(a.job_id)}">${escapeHtml(a.job_title || a.job_id)}</a>`
+					: "—";
+				return `<tr>
+        <td><a href="/inventory/${escapeHtml(a.id)}">${escapeHtml(a.label)}</a></td>
+        <td>${escapeHtml(equipmentTypeLabel(a.equipment_type))}</td>
+        <td>${escapeHtml(a.serial) || "—"}</td>
+        <td><span class="badge">${escapeHtml(assetStatusLabel(a.status))}</span></td>
+        <td>${jobCell}</td>
+      </tr>`;
+			})
+			.join("") ||
+		`<tr><td colspan="5" class="muted">No equipment yet. Add a unit below.</td></tr>`;
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow"><h1 style="margin:0">Inventory</h1></div>
+    </div>
+    <p class="muted">Tracked drying equipment — assign units on restoration jobs.</p>
+    <div class="toolbar">${statusFilters}</div>
+    <table>
+      <thead><tr><th>Unit</th><th>Type</th><th>Serial</th><th>Status</th><th>On job</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <h2>Add unit</h2>
+    <form method="post" action="/inventory" class="panel stack">
+      <div class="row">
+        <div><label for="label">Label</label>
+          <input id="label" name="label" required placeholder="AM-12" /></div>
+        <div><label for="equipment_type">Type</label>
+          <select id="equipment_type" name="equipment_type" required>${typeOptions}</select></div>
+        <div><label for="serial">Serial</label>
+          <input id="serial" name="serial" placeholder="Optional" /></div>
+      </div>
+      <div><label for="notes">Notes</label><textarea id="notes" name="notes"></textarea></div>
+      <button class="btn" type="submit">Add to inventory</button>
+    </form>`;
+
+	return c.html(page(c, "Inventory", body));
+});
+
+app.post("/inventory", async (c) => {
+	const form = await c.req.parseBody();
+	const label = String(form.label || "").trim();
+	const equipmentType = String(form.equipment_type || "");
+	if (!label || !isValidEquipmentType(equipmentType)) {
+		return c.text("Label and type required", 400);
+	}
+	const id = newId("eq");
+	await c.env.DB.prepare(
+		`INSERT INTO equipment_assets (id, label, equipment_type, serial, status, notes)
+     VALUES (?, ?, ?, ?, 'available', ?)`,
+	)
+		.bind(
+			id,
+			label,
+			equipmentType,
+			String(form.serial || "").trim() || null,
+			String(form.notes || "").trim() || null,
+		)
+		.run();
+	return c.redirect(`/inventory/${id}`);
+});
+
+app.get("/inventory/:id", async (c) => {
+	const id = c.req.param("id");
+	const asset = await c.env.DB.prepare(
+		`SELECT * FROM equipment_assets WHERE id = ?`,
+	)
+		.bind(id)
+		.first<AssetRow>();
+	if (!asset) return c.notFound();
+
+	const history = await c.env.DB.prepare(
+		`SELECT je.id, je.assigned_at, je.returned_at, j.id AS job_id, j.title AS job_title
+     FROM job_equipment je
+     JOIN jobs j ON j.id = je.job_id
+     WHERE je.asset_id = ?
+     ORDER BY je.assigned_at DESC
+     LIMIT 40`,
+	)
+		.bind(id)
+		.all<{
+			id: string;
+			assigned_at: string;
+			returned_at: string | null;
+			job_id: string;
+			job_title: string;
+		}>();
+
+	const typeOptions = EQUIPMENT_TYPES.map(
+		(t) =>
+			`<option value="${escapeHtml(t.value)}" ${asset.equipment_type === t.value ? "selected" : ""}>${escapeHtml(t.label)}</option>`,
+	).join("");
+	const statusOptions = ASSET_STATUSES.map(
+		(s) =>
+			`<option value="${escapeHtml(s.value)}" ${asset.status === s.value ? "selected" : ""}>${escapeHtml(s.label)}</option>`,
+	).join("");
+
+	const histRows =
+		history.results
+			?.map(
+				(h) => `<tr>
+        <td><a href="/jobs/${escapeHtml(h.job_id)}">${escapeHtml(h.job_title)}</a></td>
+        <td>${escapeHtml(h.assigned_at.slice(0, 16).replace("T", " "))}</td>
+        <td>${h.returned_at ? escapeHtml(h.returned_at.slice(0, 16).replace("T", " ")) : "Still out"}</td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="3" class="muted">No job history yet.</td></tr>`;
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow"><h1 style="margin:0">${escapeHtml(asset.label)}</h1></div>
+      <a class="btn secondary" href="/inventory">All inventory</a>
+    </div>
+    <form method="post" action="/inventory/${escapeHtml(id)}" class="panel stack">
+      <div class="row">
+        <div><label for="label">Label</label>
+          <input id="label" name="label" required value="${escapeHtml(asset.label)}" /></div>
+        <div><label for="equipment_type">Type</label>
+          <select id="equipment_type" name="equipment_type" required>${typeOptions}</select></div>
+        <div><label for="serial">Serial</label>
+          <input id="serial" name="serial" value="${escapeHtml(asset.serial)}" /></div>
+        <div><label for="status">Status</label>
+          <select id="status" name="status" required>${statusOptions}</select></div>
+      </div>
+      <div><label for="notes">Notes</label>
+        <textarea id="notes" name="notes">${escapeHtml(asset.notes)}</textarea></div>
+      <p class="muted">Setting status to Available while on a job does not auto-return the assignment — use Return on the job page.</p>
+      <button class="btn" type="submit">Save</button>
+    </form>
+    <h2>Assignment history</h2>
+    <table>
+      <thead><tr><th>Job</th><th>Assigned</th><th>Returned</th></tr></thead>
+      <tbody>${histRows}</tbody>
+    </table>`;
+
+	return c.html(page(c, asset.label, body));
+});
+
+app.post("/inventory/:id", async (c) => {
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const label = String(form.label || "").trim();
+	const equipmentType = String(form.equipment_type || "");
+	const status = String(form.status || "");
+	if (!label || !isValidEquipmentType(equipmentType) || !isValidAssetStatus(status)) {
+		return c.text("Label, type, and status required", 400);
+	}
+	await c.env.DB.prepare(
+		`UPDATE equipment_assets SET
+      label = ?, equipment_type = ?, serial = ?, status = ?, notes = ?,
+      updated_at = datetime('now')
+     WHERE id = ?`,
+	)
+		.bind(
+			label,
+			equipmentType,
+			String(form.serial || "").trim() || null,
+			status,
+			String(form.notes || "").trim() || null,
+			id,
+		)
+		.run();
+	return c.redirect(`/inventory/${id}`);
 });
 
 app.get("/recurring", async (c) => {
