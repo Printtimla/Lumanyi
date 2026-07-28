@@ -11,12 +11,14 @@ export type FieldJobAccess = {
 	status: string;
 	assigned_user_id: string | null;
 	job_type: string;
+	deleted_at?: string | null;
 };
 
 export type PrintJobAccess = {
 	id: string;
 	status: string;
 	assigned_user_id: string | null;
+	deleted_at?: string | null;
 };
 
 export function parseProducts(raw: string | null | undefined): ProductKey[] {
@@ -83,12 +85,14 @@ export function isPrintStatusLocked(status: string): boolean {
 }
 
 export function canReadFieldJob(user: AppUser, job: FieldJobAccess): boolean {
+	if (job.deleted_at && user.role !== "owner") return false;
 	if (!canAccessProduct(user, productForJobType(job.job_type))) return false;
 	if (canViewAllJobs(user)) return true;
 	return job.assigned_user_id === user.id;
 }
 
 export function canWriteFieldJob(user: AppUser, job: FieldJobAccess): boolean {
+	if (job.deleted_at) return false;
 	if (!canReadFieldJob(user, job)) return false;
 	if (isStatusLocked(job.status) && !canReopenJobs(user)) return false;
 	if (canViewAllJobs(user)) return true;
@@ -96,12 +100,14 @@ export function canWriteFieldJob(user: AppUser, job: FieldJobAccess): boolean {
 }
 
 export function canReadPrintJob(user: AppUser, job: PrintJobAccess): boolean {
+	if (job.deleted_at && user.role !== "owner") return false;
 	if (!canAccessProduct(user, "print")) return false;
 	if (canViewAllJobs(user)) return true;
 	return job.assigned_user_id === user.id;
 }
 
 export function canWritePrintJob(user: AppUser, job: PrintJobAccess): boolean {
+	if (job.deleted_at) return false;
 	if (!canReadPrintJob(user, job)) return false;
 	if (isPrintStatusLocked(job.status) && !canReopenJobs(user)) return false;
 	if (canViewAllJobs(user)) return true;
@@ -119,6 +125,7 @@ export function appendFieldJobListFilters(
 	restorationTypes: readonly string[],
 	floorTypes: readonly string[],
 ): void {
+	where.push("j.deleted_at IS NULL");
 	const vis = fieldJobVisibility(user);
 	if (vis.sql !== "1=1") {
 		where.push(vis.sql);

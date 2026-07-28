@@ -84,6 +84,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] Portal estimate accept
 - [x] RBAC slice: product scopes on users, tech assignment RLS, status lock (complete/invoiced; print delivered), server-side enforcement
 - [x] SA-0 / SA-1: Super Admin seat cap (2), Owner-only user admin, least-privilege create defaults, deactivate/offboard (no hard-delete)
+- [x] SA-2: Soft delete (archive) for customers / field jobs / print jobs + Owner Trash restore
 
 ## Phase 6 — Multi-brand
 

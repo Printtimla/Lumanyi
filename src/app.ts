@@ -122,6 +122,10 @@ import {
 	type FieldJobAccess,
 	type PrintJobAccess,
 } from "./lib/access";
+import {
+	canAccessTrash,
+	canSoftDelete,
+} from "./lib/soft-delete";
 
 const RESTORATION_SQL_TYPES = [
 	...RESTORATION_TYPES.map((t) => t.value),
@@ -182,7 +186,7 @@ async function loadFieldJobAccess(
 ): Promise<FieldJobAccess | null> {
 	return db
 		.prepare(
-			`SELECT id, status, assigned_user_id, job_type FROM jobs WHERE id = ?`,
+			`SELECT id, status, assigned_user_id, job_type, deleted_at FROM jobs WHERE id = ?`,
 		)
 		.bind(id)
 		.first<FieldJobAccess>();
@@ -194,7 +198,7 @@ async function loadPrintJobAccess(
 ): Promise<PrintJobAccess | null> {
 	return db
 		.prepare(
-			`SELECT id, status, assigned_user_id FROM print_jobs WHERE id = ?`,
+			`SELECT id, status, assigned_user_id, deleted_at FROM print_jobs WHERE id = ?`,
 		)
 		.bind(id)
 		.first<PrintJobAccess>();
@@ -297,12 +301,15 @@ async function enforceFieldJobRoute(
 		}
 	} else if (!canWriteFieldJob(user, job)) {
 		const locked = isStatusLocked(job.status);
+		const archived = !!job.deleted_at;
 		return c.html(
 			forbiddenHtml(
 				c,
-				locked
-					? "This job is locked (complete / invoiced). Owner or dispatcher can reopen it."
-					: "You can only edit field jobs assigned to you.",
+				archived
+					? "This job is in the Owner trash. Restore it from Trash to edit."
+					: locked
+						? "This job is locked (complete / invoiced). Owner or dispatcher can reopen it."
+						: "You can only edit field jobs assigned to you.",
 			),
 			403,
 		);
@@ -347,7 +354,9 @@ async function enforcePrintJobRoute(
 		return c.html(
 			forbiddenHtml(
 				c,
-				"This print job is locked or not assigned to you. Owner or dispatcher can reopen delivered jobs.",
+				job.deleted_at
+					? "This print job is in the Owner trash. Restore it from Trash to edit."
+					: "This print job is locked or not assigned to you. Owner or dispatcher can reopen delivered jobs.",
 			),
 			403,
 		);
@@ -435,7 +444,7 @@ app.get("/portal/jobs", async (c) => {
 
 	const jobs = await c.env.DB.prepare(
 		`SELECT id, title, job_type, status, scheduled_start, claim_number
-     FROM jobs WHERE customer_id = ? AND status != 'cancelled'
+     FROM jobs WHERE customer_id = ? AND status != 'cancelled' AND deleted_at IS NULL
      ORDER BY COALESCE(scheduled_start, created_at) DESC LIMIT 50`,
 	)
 		.bind(customer.id)
@@ -484,7 +493,7 @@ app.get("/portal/jobs/:id", async (c) => {
       s.address_line1, s.city, s.state, s.postal_code
      FROM jobs j
      LEFT JOIN sites s ON s.id = j.site_id
-     WHERE j.id = ? AND j.customer_id = ?`,
+     WHERE j.id = ? AND j.customer_id = ? AND j.deleted_at IS NULL`,
 	)
 		.bind(id, customer.id)
 		.first<{
@@ -640,7 +649,7 @@ app.post("/portal/jobs/:id/accept-estimate", async (c) => {
 	const id = c.req.param("id");
 	const job = await c.env.DB.prepare(
 		`SELECT id, status, estimate_cents, estimate_accepted_at
-     FROM jobs WHERE id = ? AND customer_id = ?`,
+     FROM jobs WHERE id = ? AND customer_id = ? AND deleted_at IS NULL`,
 	)
 		.bind(id, customer.id)
 		.first<{
@@ -1184,12 +1193,208 @@ app.post("/users/:id/active", async (c) => {
 	return c.redirect("/users");
 });
 
+app.post("/customers/:id/archive", async (c) => {
+	if (!canSoftDelete(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const row = await c.env.DB.prepare(
+		`SELECT id FROM customers WHERE id = ? AND deleted_at IS NULL`,
+	)
+		.bind(id)
+		.first();
+	if (!row) return c.notFound();
+	await c.env.DB.prepare(
+		`UPDATE customers SET deleted_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect("/trash");
+});
+
+app.post("/jobs/:id/archive", async (c) => {
+	if (!canSoftDelete(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const row = await c.env.DB.prepare(
+		`SELECT id FROM jobs WHERE id = ? AND deleted_at IS NULL`,
+	)
+		.bind(id)
+		.first();
+	if (!row) return c.notFound();
+	await c.env.DB.prepare(
+		`UPDATE jobs SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect("/trash");
+});
+
+app.post("/print/:id/archive", async (c) => {
+	if (!canSoftDelete(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const row = await c.env.DB.prepare(
+		`SELECT id FROM print_jobs WHERE id = ? AND deleted_at IS NULL`,
+	)
+		.bind(id)
+		.first();
+	if (!row) return c.notFound();
+	await c.env.DB.prepare(
+		`UPDATE print_jobs SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect("/trash");
+});
+
+app.get("/trash", async (c) => {
+	if (!canAccessTrash(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Trash is Super Admin / Owner only."),
+			403,
+		);
+	}
+	const customers = await c.env.DB.prepare(
+		`SELECT id, name, deleted_at FROM customers
+     WHERE deleted_at IS NOT NULL
+     ORDER BY deleted_at DESC LIMIT 100`,
+	).all<{ id: string; name: string; deleted_at: string }>();
+	const jobs = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.job_type, j.deleted_at, c.name AS customer_name
+     FROM jobs j
+     LEFT JOIN customers c ON c.id = j.customer_id
+     WHERE j.deleted_at IS NOT NULL
+     ORDER BY j.deleted_at DESC LIMIT 100`,
+	).all<{
+		id: string;
+		title: string;
+		job_type: string;
+		deleted_at: string;
+		customer_name: string | null;
+	}>();
+	const prints = await c.env.DB.prepare(
+		`SELECT p.id, p.title, p.product_type, p.deleted_at, c.name AS customer_name
+     FROM print_jobs p
+     LEFT JOIN customers c ON c.id = p.customer_id
+     WHERE p.deleted_at IS NOT NULL
+     ORDER BY p.deleted_at DESC LIMIT 100`,
+	).all<{
+		id: string;
+		title: string;
+		product_type: string;
+		deleted_at: string;
+		customer_name: string | null;
+	}>();
+
+	const custRows =
+		customers.results
+			?.map(
+				(r) => `<tr>
+        <td><a href="/customers/${escapeHtml(r.id)}">${escapeHtml(r.name)}</a></td>
+        <td>${escapeHtml(r.deleted_at.slice(0, 16).replace("T", " "))}</td>
+        <td>
+          <form method="post" action="/trash/customers/${escapeHtml(r.id)}/restore" class="inline">
+            <button class="btn secondary" type="submit">Restore</button>
+          </form>
+        </td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="3" class="muted">No archived customers.</td></tr>`;
+
+	const jobRows =
+		jobs.results
+			?.map(
+				(r) => `<tr>
+        <td><a href="/jobs/${escapeHtml(r.id)}">${escapeHtml(r.title)}</a></td>
+        <td>${escapeHtml(r.customer_name) || "—"}</td>
+        <td>${escapeHtml(jobTypeLabel(r.job_type))}</td>
+        <td>${escapeHtml(r.deleted_at.slice(0, 16).replace("T", " "))}</td>
+        <td>
+          <form method="post" action="/trash/jobs/${escapeHtml(r.id)}/restore" class="inline">
+            <button class="btn secondary" type="submit">Restore</button>
+          </form>
+        </td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="5" class="muted">No archived field jobs.</td></tr>`;
+
+	const printRows =
+		prints.results
+			?.map(
+				(r) => `<tr>
+        <td><a href="/print/${escapeHtml(r.id)}">${escapeHtml(r.title)}</a></td>
+        <td>${escapeHtml(r.customer_name) || "—"}</td>
+        <td>${escapeHtml(printProductLabel(r.product_type))}</td>
+        <td>${escapeHtml(r.deleted_at.slice(0, 16).replace("T", " "))}</td>
+        <td>
+          <form method="post" action="/trash/print/${escapeHtml(r.id)}/restore" class="inline">
+            <button class="btn secondary" type="submit">Restore</button>
+          </form>
+        </td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="5" class="muted">No archived print jobs.</td></tr>`;
+
+	const body = `
+    <h1>Trash / Archive</h1>
+    <p class="muted">Soft-deleted records. Restore returns them to daily lists. Hard delete is not available here (SA-4 later).</p>
+    <h2>Customers</h2>
+    <table>
+      <thead><tr><th>Name</th><th>Archived</th><th></th></tr></thead>
+      <tbody>${custRows}</tbody>
+    </table>
+    <h2>Field jobs</h2>
+    <table>
+      <thead><tr><th>Job</th><th>Customer</th><th>Type</th><th>Archived</th><th></th></tr></thead>
+      <tbody>${jobRows}</tbody>
+    </table>
+    <h2>Print jobs</h2>
+    <table>
+      <thead><tr><th>Job</th><th>Customer</th><th>Product</th><th>Archived</th><th></th></tr></thead>
+      <tbody>${printRows}</tbody>
+    </table>`;
+
+	return c.html(page(c, "Trash", body));
+});
+
+app.post("/trash/customers/:id/restore", async (c) => {
+	if (!canAccessTrash(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	await c.env.DB.prepare(
+		`UPDATE customers SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/customers/${id}`);
+});
+
+app.post("/trash/jobs/:id/restore", async (c) => {
+	if (!canAccessTrash(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	await c.env.DB.prepare(
+		`UPDATE jobs SET deleted_at = NULL, updated_at = datetime('now')
+     WHERE id = ? AND deleted_at IS NOT NULL`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/trash/print/:id/restore", async (c) => {
+	if (!canAccessTrash(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	await c.env.DB.prepare(
+		`UPDATE print_jobs SET deleted_at = NULL, updated_at = datetime('now')
+     WHERE id = ? AND deleted_at IS NOT NULL`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/print/${id}`);
+});
+
 app.get("/", async (c) => {
 	const user = c.get("user")!;
 	const today = new Date().toISOString().slice(0, 10);
 	const office = canSeeOfficeTools(user);
 	const vis = fieldJobVisibility(user);
-	const fieldWhere = ["status != 'cancelled'"];
+	const fieldWhere = ["status != 'cancelled'", "deleted_at IS NULL"];
 	const fieldBinds: string[] = [];
 	if (vis.sql !== "1=1") {
 		fieldWhere.push(vis.sql.replace(/^j\./, ""));
@@ -1242,7 +1447,7 @@ app.get("/", async (c) => {
 		ready_n: number;
 	} | null = null;
 	if (canAccessProduct(user, "print")) {
-		const printWhere = ["status != 'cancelled'"];
+		const printWhere = ["status != 'cancelled'", "deleted_at IS NULL"];
 		const printBinds: string[] = [];
 		if (printVis.sql !== "1=1") {
 			printWhere.push(printVis.sql.replace(/^p\./, ""));
@@ -1560,13 +1765,14 @@ app.get("/customers", async (c) => {
 	const list = q
 		? await c.env.DB.prepare(
 				`SELECT id, name, phone, email, created_at FROM customers
-         WHERE name LIKE ? OR phone LIKE ? OR email LIKE ?
+         WHERE deleted_at IS NULL AND (name LIKE ? OR phone LIKE ? OR email LIKE ?)
          ORDER BY name COLLATE NOCASE LIMIT 100`,
 			)
 				.bind(`%${q}%`, `%${q}%`, `%${q}%`)
 				.all()
 		: await c.env.DB.prepare(
 				`SELECT id, name, phone, email, created_at FROM customers
+         WHERE deleted_at IS NULL
          ORDER BY name COLLATE NOCASE LIMIT 100`,
 			).all();
 
@@ -1677,8 +1883,9 @@ app.get("/customers/:id", async (c) => {
 		);
 	}
 	const id = c.req.param("id");
+	const user = c.get("user")!;
 	const customer = await c.env.DB.prepare(
-		`SELECT * FROM customers WHERE id = ?`,
+		`SELECT id, name, phone, email, notes, deleted_at FROM customers WHERE id = ?`,
 	)
 		.bind(id)
 		.first<{
@@ -1687,8 +1894,12 @@ app.get("/customers/:id", async (c) => {
 			phone: string | null;
 			email: string | null;
 			notes: string | null;
+			deleted_at: string | null;
 		}>();
 	if (!customer) return c.notFound();
+	if (customer.deleted_at && !canAccessTrash(user)) {
+		return c.notFound();
+	}
 
 	const sites = await c.env.DB.prepare(
 		`SELECT * FROM sites WHERE customer_id = ? ORDER BY created_at`,
@@ -1705,7 +1916,7 @@ app.get("/customers/:id", async (c) => {
 
 	const jobs = await c.env.DB.prepare(
 		`SELECT id, title, job_type, status, scheduled_start FROM jobs
-     WHERE customer_id = ? ORDER BY created_at DESC LIMIT 20`,
+     WHERE customer_id = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 20`,
 	)
 		.bind(id)
 		.all<{
@@ -1783,10 +1994,28 @@ app.get("/customers/:id", async (c) => {
 		: "";
 
 	const body = `
+    ${
+			customer.deleted_at
+				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This customer is archived (soft-deleted) on ${escapeHtml(customer.deleted_at.slice(0, 16).replace("T", " "))}. Restore from Trash to use in daily lists.</div>`
+				: ""
+		}
     <div class="toolbar">
       <div class="grow"><h1 style="margin:0">${escapeHtml(customer.name)}</h1></div>
-      <a class="btn" href="/jobs/new?product=restoration&customer_id=${escapeHtml(customer.id)}">New restoration</a>
-      <a class="btn secondary" href="/jobs/new?product=floors&customer_id=${escapeHtml(customer.id)}">New floor job</a>
+      ${
+				customer.deleted_at
+					? canAccessTrash(c.get("user")!)
+						? `<form method="post" action="/trash/customers/${escapeHtml(customer.id)}/restore" class="inline"><button class="btn" type="submit">Restore</button></form>`
+						: ""
+					: canSoftDelete(c.get("user")!)
+						? `<form method="post" action="/customers/${escapeHtml(customer.id)}/archive" class="inline" onsubmit="return confirm('Archive this customer? Hidden from lists; Super Admin can restore from Trash.');"><button class="btn secondary" type="submit">Archive</button></form>`
+						: ""
+			}
+      ${
+				customer.deleted_at
+					? ""
+					: `<a class="btn" href="/jobs/new?product=restoration&customer_id=${escapeHtml(customer.id)}">New restoration</a>
+      <a class="btn secondary" href="/jobs/new?product=floors&customer_id=${escapeHtml(customer.id)}">New floor job</a>`
+			}
     </div>
     ${mintedFlash}
     <div class="panel stack">
@@ -1821,7 +2050,7 @@ app.post("/customers/:id/portal", async (c) => {
 	if (!canSeeOfficeTools(c.get("user")!)) return c.text("Forbidden", 403);
 	const id = c.req.param("id");
 	const customer = await c.env.DB.prepare(
-		`SELECT id FROM customers WHERE id = ?`,
+		`SELECT id FROM customers WHERE id = ? AND deleted_at IS NULL`,
 	)
 		.bind(id)
 		.first();
@@ -2397,7 +2626,7 @@ app.get("/jobs/new", async (c) => {
 		return c.html(forbiddenHtml(c, "Your account does not include Floors."), 403);
 	}
 	const customers = await c.env.DB.prepare(
-		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name FROM customers WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
 		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
@@ -2684,13 +2913,16 @@ app.get("/jobs/:id", async (c) => {
 		job_type: job.job_type,
 	};
 	const canWrite = canWriteFieldJob(user, accessJob);
-	const lockedBanner = !canWrite
-		? isStatusLocked(job.status)
-			? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This job is locked (complete / invoiced). Field edits are disabled for techs. Owner or dispatcher can change status to reopen.</div>`
-			: `<div class="flash">Read-only — you can view this job but not edit it.</div>`
-		: isStatusLocked(job.status)
-			? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">Job is complete / invoiced. Change status below to reopen before field edits by techs.</div>`
-			: "";
+	const isArchived = !!accessJob.deleted_at;
+	const lockedBanner = isArchived
+		? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This job is archived (soft-deleted). Restore it from Trash to edit.</div>`
+		: !canWrite
+			? isStatusLocked(job.status)
+				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This job is locked (complete / invoiced). Field edits are disabled for techs. Owner or dispatcher can change status to reopen.</div>`
+				: `<div class="flash">Read-only — you can view this job but not edit it.</div>`
+			: isStatusLocked(job.status)
+				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">Job is complete / invoiced. Change status below to reopen before field edits by techs.</div>`
+				: "";
 
 	const staff = await c.env.DB.prepare(
 		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
@@ -3128,6 +3360,13 @@ app.get("/jobs/:id", async (c) => {
       <a class="btn secondary" href="/jobs/${escapeHtml(id)}/estimate">Estimate</a>
       <a class="btn secondary" href="/jobs/${escapeHtml(id)}/estimate.pdf">PDF</a>
       ${isRestoration ? `<a class="btn secondary" href="/jobs/${escapeHtml(id)}/water-loss.pdf">Water-loss PDF</a>` : ""}
+      ${
+				isArchived && canAccessTrash(user)
+					? `<form method="post" action="/trash/jobs/${escapeHtml(id)}/restore" class="inline"><button class="btn" type="submit">Restore</button></form>`
+					: !isArchived && canSoftDelete(user)
+						? `<form method="post" action="/jobs/${escapeHtml(id)}/archive" class="inline" onsubmit="return confirm('Archive this job? It leaves daily lists; Super Admin can restore from Trash.');"><button class="btn secondary" type="submit">Archive</button></form>`
+						: ""
+			}
     </div>
 
     <div class="row" style="margin-top:1rem">
@@ -4776,7 +5015,7 @@ app.get("/recurring", async (c) => {
 	}>();
 
 	const customers = await c.env.DB.prepare(
-		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name FROM customers WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
 		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
@@ -4973,7 +5212,7 @@ app.get("/print", async (c) => {
 						`SELECT p.*, c.name AS customer_name
          FROM print_jobs p
          LEFT JOIN customers c ON c.id = p.customer_id
-         WHERE p.status = ?${pExtra}
+         WHERE p.status = ? AND p.deleted_at IS NULL${pExtra}
          ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
          LIMIT 100`,
 					).bind(status, ...pVis.binds)
@@ -4981,7 +5220,7 @@ app.get("/print", async (c) => {
 						`SELECT p.*, c.name AS customer_name
          FROM print_jobs p
          LEFT JOIN customers c ON c.id = p.customer_id
-         WHERE p.status = ?
+         WHERE p.status = ? AND p.deleted_at IS NULL
          ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
          LIMIT 100`,
 					).bind(status)
@@ -4991,7 +5230,7 @@ app.get("/print", async (c) => {
 						`SELECT p.*, c.name AS customer_name
          FROM print_jobs p
          LEFT JOIN customers c ON c.id = p.customer_id
-         WHERE p.status != 'cancelled'${pExtra}
+         WHERE p.status != 'cancelled' AND p.deleted_at IS NULL${pExtra}
          ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
          LIMIT 100`,
 					).bind(...pVis.binds)
@@ -4999,7 +5238,7 @@ app.get("/print", async (c) => {
 						`SELECT p.*, c.name AS customer_name
          FROM print_jobs p
          LEFT JOIN customers c ON c.id = p.customer_id
-         WHERE p.status != 'cancelled'
+         WHERE p.status != 'cancelled' AND p.deleted_at IS NULL
          ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
          LIMIT 100`,
 					)
@@ -5067,7 +5306,7 @@ app.get("/print/board", async (c) => {
       c.name AS customer_name
      FROM print_jobs p
      LEFT JOIN customers c ON c.id = p.customer_id
-     WHERE p.status IN ('intake','proof','approved','in_production','ready')${pExtra}
+     WHERE p.status IN ('intake','proof','approved','in_production','ready') AND p.deleted_at IS NULL${pExtra}
      ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
      LIMIT 200`,
 			).bind(...pVis.binds)
@@ -5076,7 +5315,7 @@ app.get("/print/board", async (c) => {
       c.name AS customer_name
      FROM print_jobs p
      LEFT JOIN customers c ON c.id = p.customer_id
-     WHERE p.status IN ('intake','proof','approved','in_production','ready')
+     WHERE p.status IN ('intake','proof','approved','in_production','ready') AND p.deleted_at IS NULL
      ORDER BY COALESCE(p.due_date, '9999') ASC, p.updated_at DESC
      LIMIT 200`,
 			)
@@ -5134,7 +5373,7 @@ app.get("/print/new", async (c) => {
 	if (!canAccessProduct(c.get("user")!, "print")) return c.html(forbiddenHtml(c, "Your account does not include Print Ops."), 403);
 	if (!canSeeOfficeTools(c.get("user")!)) return c.html(forbiddenHtml(c, "Creating print jobs is for owner / dispatcher."), 403);
 	const customers = await c.env.DB.prepare(
-		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name FROM customers WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
 		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
@@ -5269,14 +5508,17 @@ app.get("/print/:id", async (c) => {
 			assigned_user_id: string | null;
 			assignee_name: string | null;
 			assignee_role: string | null;
+			deleted_at: string | null;
 		}>();
 	if (!job) return c.notFound();
 
+	const user = c.get("user")!;
+	const isArchived = !!job.deleted_at;
 	const staff = await c.env.DB.prepare(
 		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 	const customers = await c.env.DB.prepare(
-		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name FROM customers WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const files = await c.env.DB.prepare(
 		`SELECT id, kind, filename, created_at FROM print_files
@@ -5383,6 +5625,11 @@ app.get("/print/:id", async (c) => {
     </div>`;
 
 	const body = `
+    ${
+			isArchived
+				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This print job is archived (soft-deleted). Restore from Trash to edit.</div>`
+				: ""
+		}
     <div class="toolbar">
       <div class="grow">
         <h1 style="margin:0">${escapeHtml(job.title)}</h1>
@@ -5394,6 +5641,13 @@ app.get("/print/:id", async (c) => {
       </div>
       <a class="btn secondary" href="/print/board">Press board</a>
       <a class="btn secondary" href="/print">All print jobs</a>
+      ${
+				isArchived && canAccessTrash(user)
+					? `<form method="post" action="/trash/print/${escapeHtml(id)}/restore" class="inline"><button class="btn" type="submit">Restore</button></form>`
+					: !isArchived && canSoftDelete(user)
+						? `<form method="post" action="/print/${escapeHtml(id)}/archive" class="inline" onsubmit="return confirm('Archive this print job?');"><button class="btn secondary" type="submit">Archive</button></form>`
+						: ""
+			}
     </div>
 
     <h2>Proof &amp; production</h2>
@@ -5743,6 +5997,7 @@ app.get("/tech", async (c) => {
      JOIN customers c ON c.id = j.customer_id
      LEFT JOIN sites s ON s.id = j.site_id
      WHERE j.assigned_user_id = ?
+       AND j.deleted_at IS NULL
        AND j.status IN ('scheduled', 'in_progress', 'estimate')
      ORDER BY COALESCE(j.scheduled_start, '9999') ASC
      LIMIT 80`,
