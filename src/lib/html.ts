@@ -46,7 +46,7 @@ export function layout(opts: {
 
 	const userBar = opts.user
 		? `<div class="userbar">
-        <span>${escapeHtml(opts.user.name)} · ${escapeHtml(roleLabel(opts.user.role))}</span>
+        <span>${escapeHtml(opts.user.name)} · ${escapeHtml(roleLabel(opts.user.designation || opts.user.role))}</span>
         <a href="/account/password">Password</a>
         <form method="post" action="/logout" class="inline">
           <button type="submit" class="linkish">Log out</button>

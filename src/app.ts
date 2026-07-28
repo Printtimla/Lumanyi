@@ -45,6 +45,7 @@ import {
 import {
 	assigneeOptionLabel,
 	isValidUserRole,
+	permissionRoleFor,
 	roleLabel,
 	USER_ROLES,
 } from "./lib/roles";
@@ -326,13 +327,15 @@ app.get("/users", async (c) => {
 		);
 	}
 	const list = await c.env.DB.prepare(
-		`SELECT id, name, email, role, must_change_password, created_at
+		`SELECT id, name, email, role, COALESCE(designation, role) AS designation,
+      must_change_password, created_at
      FROM users ORDER BY name COLLATE NOCASE`,
 	).all<{
 		id: string;
 		name: string;
 		email: string;
 		role: string;
+		designation: string;
 		must_change_password: number;
 		created_at: string;
 	}>();
@@ -343,7 +346,7 @@ app.get("/users", async (c) => {
 				(u) => `<tr>
         <td>${escapeHtml(u.name)}</td>
         <td>${escapeHtml(u.email)}</td>
-        <td>${escapeHtml(roleLabel(u.role))}</td>
+        <td>${escapeHtml(roleLabel(u.designation))}</td>
         <td>${u.must_change_password ? "Must change" : "OK"}</td>
       </tr>`,
 			)
@@ -408,11 +411,12 @@ app.post("/users", async (c) => {
 	if (existing) return c.text("Email already exists", 400);
 
 	const passwordHash = await hashPassword(tempPassword);
+	const permissionRole = permissionRoleFor(role);
 	await c.env.DB.prepare(
-		`INSERT INTO users (id, email, name, password_hash, role, must_change_password)
-     VALUES (?, ?, ?, ?, ?, 1)`,
+		`INSERT INTO users (id, email, name, password_hash, role, designation, must_change_password)
+     VALUES (?, ?, ?, ?, ?, ?, 1)`,
 	)
-		.bind(newId("usr"), email, name, passwordHash, role)
+		.bind(newId("usr"), email, name, passwordHash, permissionRole, role)
 		.run();
 	return c.redirect("/users");
 });
@@ -760,7 +764,7 @@ app.get("/jobs", async (c) => {
 			}>();
 
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const rows =
@@ -973,7 +977,7 @@ app.get("/jobs/new", async (c) => {
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const options =
@@ -1208,7 +1212,7 @@ app.get("/jobs/:id", async (c) => {
 	const job = await c.env.DB.prepare(
 		`SELECT j.*, c.name AS customer_name,
       s.address_line1, s.city, s.state, s.postal_code,
-      a.name AS assignee_name, a.role AS assignee_role
+      a.name AS assignee_name, COALESCE(a.designation, a.role) AS assignee_role
      FROM jobs j
      JOIN customers c ON c.id = j.customer_id
      LEFT JOIN sites s ON s.id = j.site_id
@@ -1242,7 +1246,7 @@ app.get("/jobs/:id", async (c) => {
 	if (!job) return c.notFound();
 
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const checklist = await c.env.DB.prepare(
@@ -2188,7 +2192,7 @@ app.get("/recurring", async (c) => {
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const rows =
@@ -2495,7 +2499,7 @@ app.get("/print/new", async (c) => {
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const customerOptions =
@@ -2598,7 +2602,8 @@ app.post("/print", async (c) => {
 app.get("/print/:id", async (c) => {
 	const id = c.req.param("id");
 	const job = await c.env.DB.prepare(
-		`SELECT p.*, c.name AS customer_name, u.name AS assignee_name, u.role AS assignee_role
+		`SELECT p.*, c.name AS customer_name, u.name AS assignee_name,
+      COALESCE(u.designation, u.role) AS assignee_role
      FROM print_jobs p
      LEFT JOIN customers c ON c.id = p.customer_id
      LEFT JOIN users u ON u.id = p.assigned_user_id
@@ -2628,7 +2633,7 @@ app.get("/print/:id", async (c) => {
 	if (!job) return c.notFound();
 
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,

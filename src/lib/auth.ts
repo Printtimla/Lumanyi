@@ -2,13 +2,14 @@ import type { Context } from "hono";
 import { setCookie, deleteCookie } from "hono/cookie";
 import { newId } from "./ids";
 import { hashPassword } from "./password";
-import type { UserRole } from "./roles";
+import type { PermissionRole } from "./roles";
 
 export type AppUser = {
 	id: string;
 	email: string;
 	name: string;
-	role: UserRole;
+	role: PermissionRole;
+	designation: string;
 	mustChangePassword: boolean;
 };
 
@@ -71,7 +72,9 @@ export async function getSessionUser(
 
 	const row = await db
 		.prepare(
-			`SELECT u.id, u.email, u.name, u.role, u.must_change_password, s.expires_at
+			`SELECT u.id, u.email, u.name, u.role,
+        COALESCE(u.designation, u.role) AS designation,
+        u.must_change_password, s.expires_at
      FROM sessions s
      JOIN users u ON u.id = s.user_id
      WHERE s.id = ?`,
@@ -81,7 +84,8 @@ export async function getSessionUser(
 			id: string;
 			email: string;
 			name: string;
-			role: AppUser["role"];
+			role: string;
+			designation: string;
 			must_change_password: number;
 			expires_at: string;
 		}>();
@@ -92,11 +96,15 @@ export async function getSessionUser(
 		return null;
 	}
 
+	const permissionRole: AppUser["role"] =
+		row.role === "owner" || row.role === "dispatcher" ? row.role : "tech";
+
 	return {
 		id: row.id,
 		email: row.email,
 		name: row.name,
-		role: row.role,
+		role: permissionRole,
+		designation: row.designation || permissionRole,
 		mustChangePassword: row.must_change_password === 1,
 	};
 }
