@@ -5010,16 +5010,21 @@ app.post("/print/:id/quote/:lineId/delete", async (c) => {
 
 app.get("/tech", async (c) => {
 	const user = c.get("user")!;
+	const view = c.req.query("view") === "all" ? "all" : "today";
+	const today = new Date().toISOString().slice(0, 10);
+
 	const jobs = await c.env.DB.prepare(
 		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name,
-      s.address_line1, s.city
+      s.address_line1, s.city,
+      (SELECT COUNT(*) FROM job_checklist_items ci WHERE ci.job_id = j.id) AS checklist_total,
+      (SELECT COUNT(*) FROM job_checklist_items ci WHERE ci.job_id = j.id AND ci.done = 1) AS checklist_done
      FROM jobs j
      JOIN customers c ON c.id = j.customer_id
      LEFT JOIN sites s ON s.id = j.site_id
      WHERE j.assigned_user_id = ?
        AND j.status IN ('scheduled', 'in_progress', 'estimate')
      ORDER BY COALESCE(j.scheduled_start, '9999') ASC
-     LIMIT 40`,
+     LIMIT 80`,
 	)
 		.bind(user.id)
 		.all<{
@@ -5031,33 +5036,101 @@ app.get("/tech", async (c) => {
 			customer_name: string;
 			address_line1: string | null;
 			city: string | null;
+			checklist_total: number;
+			checklist_done: number;
 		}>();
 
-	const cards =
-		jobs.results
-			?.map((j) => {
-				const when = j.scheduled_start
-					? j.scheduled_start.slice(0, 16).replace("T", " ")
-					: "Unscheduled";
-				const where = j.address_line1
-					? `${j.address_line1}${j.city ? `, ${j.city}` : ""}`
-					: "No address";
-				return `<a class="panel stack" href="/jobs/${escapeHtml(j.id)}" style="color:inherit;text-decoration:none">
-        <div style="display:flex;justify-content:space-between;gap:0.5rem;align-items:start">
-          <strong>${escapeHtml(j.title)}</strong>
-          <span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span>
-        </div>
-        <div class="muted">${escapeHtml(j.customer_name)} · ${escapeHtml(jobTypeLabel(j.job_type))}</div>
-        <div>${escapeHtml(when)}</div>
-        <div class="muted">${escapeHtml(where)}</div>
-      </a>`;
-			})
-			.join("") || `<p class="muted">No jobs assigned to you.</p>`;
+	type TechJob = {
+		id: string;
+		title: string;
+		job_type: string;
+		status: string;
+		scheduled_start: string | null;
+		customer_name: string;
+		address_line1: string | null;
+		city: string | null;
+		checklist_total: number;
+		checklist_done: number;
+	};
+
+	const all = (jobs.results || []) as TechJob[];
+
+	const bucket = (j: TechJob): "today" | "later" | "unscheduled" => {
+		const day = j.scheduled_start?.slice(0, 10) || null;
+		if (day && day > today) return "later";
+		if (day && day === today) return "today";
+		if (j.status === "in_progress") return "today";
+		if (day && day < today) return "today"; // overdue still on day list
+		return "unscheduled";
+	};
+
+	const todayJobs = all.filter((j) => bucket(j) === "today");
+	const laterJobs = all.filter((j) => bucket(j) === "later");
+	const unscheduledJobs = all.filter((j) => bucket(j) === "unscheduled");
+
+	const card = (j: TechJob) => {
+		const when = j.scheduled_start
+			? j.scheduled_start.slice(0, 16).replace("T", " ")
+			: "Unscheduled";
+		const where = j.address_line1
+			? `${j.address_line1}${j.city ? `, ${j.city}` : ""}`
+			: "No address";
+		const check =
+			j.checklist_total > 0
+				? `${j.checklist_done}/${j.checklist_total} checklist`
+				: "No checklist";
+		return `<a class="panel stack" href="/jobs/${escapeHtml(j.id)}" style="color:inherit;text-decoration:none">
+      <div style="display:flex;justify-content:space-between;gap:0.5rem;align-items:start">
+        <strong>${escapeHtml(j.title)}</strong>
+        <span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span>
+      </div>
+      <div class="muted">${escapeHtml(j.customer_name)} · ${escapeHtml(jobTypeLabel(j.job_type))}</div>
+      <div>${escapeHtml(when)}</div>
+      <div class="muted">${escapeHtml(where)}</div>
+      <div class="muted" style="font-size:0.85rem">${escapeHtml(check)}</div>
+    </a>`;
+	};
+
+	const section = (title: string, list: TechJob[], empty: string) => {
+		const cards =
+			list.map(card).join("") || `<p class="muted">${escapeHtml(empty)}</p>`;
+		return `<h2 style="margin-top:1.25rem">${escapeHtml(title)} <span class="muted">(${list.length})</span></h2>
+      <div class="stack">${cards}</div>`;
+	};
+
+	let sectionsHtml = "";
+	if (view === "today") {
+		sectionsHtml = section(
+			"Today",
+			todayJobs,
+			"Nothing on your day list for today.",
+		);
+		if (laterJobs.length) {
+			sectionsHtml += section("Later", laterJobs, "");
+		}
+		if (unscheduledJobs.length) {
+			sectionsHtml += section("Unscheduled", unscheduledJobs, "");
+		}
+	} else {
+		sectionsHtml =
+			section("Today", todayJobs, "Nothing scheduled today.") +
+			section("Later", laterJobs, "No later jobs.") +
+			section("Unscheduled", unscheduledJobs, "No unscheduled open jobs.");
+	}
 
 	const body = `
-    <h1>My jobs</h1>
-    <p class="muted">Assigned to ${escapeHtml(user.name)} — tap a card to update checklist and notes.</p>
-    <div class="stack" style="margin-top:1rem">${cards}</div>`;
+    <div class="toolbar">
+      <div class="grow">
+        <h1 style="margin:0">My day</h1>
+        <p class="muted" style="margin:0.35rem 0 0">Assigned to ${escapeHtml(user.name)} · ${escapeHtml(today)}. Tap a card for checklist, notes, and moisture.</p>
+      </div>
+    </div>
+    <div class="quick-links">
+      <a href="/tech"${view === "today" ? ' style="font-weight:700"' : ""}>Today</a>
+      <a href="/tech?view=all"${view === "all" ? ' style="font-weight:700"' : ""}>All my open jobs</a>
+      <a href="/calendar">Calendar</a>
+    </div>
+    ${sectionsHtml}`;
 
 	return c.html(page(c, "Tech", body));
 });

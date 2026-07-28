@@ -80,6 +80,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] Ops dashboard (home snapshot)
 - [x] Auto GPP from temp + RH on moisture logs
 - [x] Moisture map image uploads (2D)
+- [x] Tech day list polish (`/tech`)
 
 ## Phase 6 — Multi-brand
 
