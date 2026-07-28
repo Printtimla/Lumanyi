@@ -4,8 +4,10 @@ import { getCookie } from "hono/cookie";
 import {
 	SESSION_COOKIE,
 	clearSessionCookie,
+	countActiveOwners,
 	createSession,
 	destroySession,
+	destroySessionsForUser,
 	ensureSeedUser,
 	getSessionUser,
 	setSessionCookie,
@@ -46,9 +48,12 @@ import {
 } from "./lib/products";
 import {
 	assigneeOptionLabel,
+	defaultProductsForDesignation,
 	isValidUserRole,
+	LEAST_PRIVILEGE_DESIGNATION,
 	permissionRoleFor,
 	roleLabel,
+	SUPER_ADMIN_SEAT_LIMIT,
 	USER_ROLES,
 } from "./lib/roles";
 import {
@@ -112,6 +117,7 @@ import {
 	printJobVisibility,
 	productLabel,
 	productsFromForm,
+	productsSelectedFromForm,
 	serializeProducts,
 	type FieldJobAccess,
 	type PrintJobAccess,
@@ -726,7 +732,9 @@ app.post("/login", async (c) => {
 	};
 
 	const row = await c.env.DB.prepare(
-		`SELECT id, email, name, role, password_hash, must_change_password FROM users WHERE email = ?`,
+		`SELECT id, email, name, role, password_hash, must_change_password,
+      COALESCE(active, 1) AS active
+     FROM users WHERE email = ?`,
 	)
 		.bind(email)
 		.first<{
@@ -736,10 +744,16 @@ app.post("/login", async (c) => {
 			role: AppUser["role"];
 			password_hash: string;
 			must_change_password: number;
+			active: number;
 		}>();
 
 	if (!row) {
 		return renderLoginError("Invalid email or password.");
+	}
+	if (row.active !== 1) {
+		return renderLoginError(
+			"This account is deactivated. Contact a Super Admin.",
+		);
 	}
 
 	let ok = await verifyPassword(password, row.password_hash);
@@ -873,13 +887,15 @@ app.post("/account/password", async (c) => {
 app.get("/users", async (c) => {
 	if (!canManageUsers(c.get("user")!)) {
 		return c.html(
-			page(c, "Users", `<h1>Users</h1><p class="muted">Owner access only.</p>`),
+			page(c, "Users", `<h1>Users</h1><p class="muted">Super Admin / Owner access only.</p>`),
 			403,
 		);
 	}
+	const me = c.get("user")!;
+	const ownerSeats = await countActiveOwners(c.env.DB);
 	const list = await c.env.DB.prepare(
 		`SELECT id, name, email, role, COALESCE(designation, role) AS designation,
-      products, must_change_password, created_at
+      products, must_change_password, COALESCE(active, 1) AS active, created_at
      FROM users ORDER BY name COLLATE NOCASE`,
 	).all<{
 		id: string;
@@ -889,6 +905,7 @@ app.get("/users", async (c) => {
 		designation: string;
 		products: string | null;
 		must_change_password: number;
+		active: number;
 		created_at: string;
 	}>();
 
@@ -898,19 +915,34 @@ app.get("/users", async (c) => {
 				const prods = parseProducts(u.products)
 					.map((p) => productLabel(p))
 					.join(", ");
-				const checks = ALL_PRODUCTS.map(
-					(p) => {
-						const on = parseProducts(u.products).includes(p);
-						return `<label style="margin-right:0.75rem;font-weight:400">
+				const checks = ALL_PRODUCTS.map((p) => {
+					const on = parseProducts(u.products).includes(p);
+					return `<label style="margin-right:0.75rem;font-weight:400">
               <input type="checkbox" name="product_${p}" ${on ? "checked" : ""} /> ${escapeHtml(productLabel(p))}
             </label>`;
-					},
+				}).join("");
+				const designationOptions = USER_ROLES.map(
+					(r) =>
+						`<option value="${escapeHtml(r.value)}" ${u.designation === r.value ? "selected" : ""}>${escapeHtml(r.label)}</option>`,
 				).join("");
+				const isActive = u.active === 1;
+				const statusCell = isActive
+					? `<span class="badge scheduled">Active</span>`
+					: `<span class="badge cancelled">Deactivated</span>`;
+				const toggleLabel = isActive ? "Deactivate" : "Reactivate";
+				const toggleValue = isActive ? "0" : "1";
+				const selfNote = u.id === me.id ? " (you)" : "";
 				return `<tr>
-        <td>${escapeHtml(u.name)}</td>
+        <td>${escapeHtml(u.name)}${escapeHtml(selfNote)}</td>
         <td>${escapeHtml(u.email)}</td>
-        <td>${escapeHtml(roleLabel(u.designation))}</td>
+        <td>
+          <form method="post" action="/users/${escapeHtml(u.id)}/designation" class="inline" style="display:flex;gap:0.35rem;align-items:center">
+            <select name="role" required>${designationOptions}</select>
+            <button class="btn secondary" type="submit" style="padding:0.25rem 0.5rem;font-size:0.85rem">Save</button>
+          </form>
+        </td>
         <td>${escapeHtml(prods)}</td>
+        <td>${statusCell}</td>
         <td>${u.must_change_password ? "Must change" : "OK"}</td>
         <td>
           <form method="post" action="/users/${escapeHtml(u.id)}/products" class="inline" style="display:flex;flex-wrap:wrap;gap:0.25rem;align-items:center">
@@ -918,23 +950,34 @@ app.get("/users", async (c) => {
             <button class="btn secondary" type="submit" style="padding:0.25rem 0.5rem;font-size:0.85rem">Save</button>
           </form>
         </td>
+        <td>
+          <form method="post" action="/users/${escapeHtml(u.id)}/active" class="inline"
+            onsubmit="return confirm('${isActive ? "Deactivate this employee? They will be signed out and removed from assignee lists. History stays." : "Reactivate this employee?"}');">
+            <input type="hidden" name="active" value="${toggleValue}" />
+            <button class="linkish" type="submit">${toggleLabel}</button>
+          </form>
+        </td>
       </tr>`;
 			})
 			.join("") || "";
 
+	const defaultProds = defaultProductsForDesignation(LEAST_PRIVILEGE_DESIGNATION);
 	const createProductChecks = ALL_PRODUCTS.map(
 		(p) =>
 			`<label style="margin-right:1rem;font-weight:400">
-        <input type="checkbox" name="product_${p}" checked /> ${escapeHtml(productLabel(p))}
+        <input type="checkbox" name="product_${p}" ${defaultProds.includes(p) ? "checked" : ""} /> ${escapeHtml(productLabel(p))}
       </label>`,
 	).join("");
 
 	const body = `
     <div class="toolbar">
-      <div class="grow"><h1 style="margin:0">Users</h1></div>
+      <div class="grow">
+        <h1 style="margin:0">Users</h1>
+        <p class="muted" style="margin:0.35rem 0 0">Super Admin seats: ${ownerSeats}/${SUPER_ADMIN_SEAT_LIMIT} active. Deactivate offboards staff without deleting history.</p>
+      </div>
     </div>
     <table>
-      <thead><tr><th>Name</th><th>Email</th><th>Designation</th><th>Products</th><th>Password</th><th>Edit products</th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th>Designation</th><th>Products</th><th>Status</th><th>Password</th><th>Edit products</th><th>Offboard</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <h2>Add user</h2>
@@ -949,7 +992,7 @@ app.get("/users", async (c) => {
           <select id="role" name="role" required>
             ${USER_ROLES.map(
 							(r) =>
-								`<option value="${escapeHtml(r.value)}" ${r.value === "tech" ? "selected" : ""}>${escapeHtml(r.label)}</option>`,
+								`<option value="${escapeHtml(r.value)}" ${r.value === LEAST_PRIVILEGE_DESIGNATION ? "selected" : ""}>${escapeHtml(r.label)}</option>`,
 						).join("")}
           </select>
         </div>
@@ -959,10 +1002,10 @@ app.get("/users", async (c) => {
         </div>
       </div>
       <div>
-        <span class="muted">Products</span><br />
+        <span class="muted">Products (department pin). Leave unchecked to use designation defaults.</span><br />
         ${createProductChecks}
       </div>
-      <p class="muted">New users must change password on first login. Techs only see jobs assigned to them within their products.</p>
+      <p class="muted">New users must change password on first login. Only Super Admins can create or promote Super Admins (max ${SUPER_ADMIN_SEAT_LIMIT}). Default designation is least privilege (Mitigation Tech).</p>
       <button class="btn" type="submit">Create user</button>
     </form>`;
 
@@ -976,13 +1019,13 @@ app.post("/users", async (c) => {
 	const email = String(form.email || "")
 		.trim()
 		.toLowerCase();
-	const role = String(form.role || "");
+	const rawRole = String(form.role || "").trim();
+	const designation = isValidUserRole(rawRole)
+		? rawRole
+		: LEAST_PRIVILEGE_DESIGNATION;
 	const tempPassword = String(form.temp_password || "");
 	if (!name || !email || tempPassword.length < 8) {
 		return c.text("Name, email, and password (8+ chars) required", 400);
-	}
-	if (!isValidUserRole(role)) {
-		return c.text("Invalid designation", 400);
 	}
 	const existing = await c.env.DB.prepare(
 		`SELECT id FROM users WHERE email = ?`,
@@ -991,12 +1034,27 @@ app.post("/users", async (c) => {
 		.first();
 	if (existing) return c.text("Email already exists", 400);
 
+	const permissionRole = permissionRoleFor(designation);
+	if (permissionRole === "owner") {
+		const seats = await countActiveOwners(c.env.DB);
+		if (seats >= SUPER_ADMIN_SEAT_LIMIT) {
+			return c.text(
+				`Super Admin / Owner seats full (${seats}/${SUPER_ADMIN_SEAT_LIMIT}).`,
+				400,
+			);
+		}
+	}
+
+	const selected = productsSelectedFromForm(form as Record<string, unknown>);
+	const products = serializeProducts(
+		selected.length
+			? selected
+			: defaultProductsForDesignation(designation),
+	);
 	const passwordHash = await hashPassword(tempPassword);
-	const permissionRole = permissionRoleFor(role);
-	const products = serializeProducts(productsFromForm(form as Record<string, unknown>));
 	await c.env.DB.prepare(
-		`INSERT INTO users (id, email, name, password_hash, role, designation, products, must_change_password)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+		`INSERT INTO users (id, email, name, password_hash, role, designation, products, must_change_password, active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1)`,
 	)
 		.bind(
 			newId("usr"),
@@ -1004,7 +1062,7 @@ app.post("/users", async (c) => {
 			name,
 			passwordHash,
 			permissionRole,
-			role,
+			designation,
 			products,
 		)
 		.run();
@@ -1015,14 +1073,114 @@ app.post("/users/:id/products", async (c) => {
 	if (!canManageUsers(c.get("user")!)) return c.text("Forbidden", 403);
 	const id = c.req.param("id");
 	const form = await c.req.parseBody();
-	const products = serializeProducts(productsFromForm(form as Record<string, unknown>));
-	const row = await c.env.DB.prepare(`SELECT id FROM users WHERE id = ?`)
+	const selected = productsSelectedFromForm(form as Record<string, unknown>);
+	const row = await c.env.DB.prepare(
+		`SELECT id, COALESCE(designation, role) AS designation FROM users WHERE id = ?`,
+	)
 		.bind(id)
-		.first();
+		.first<{ id: string; designation: string }>();
 	if (!row) return c.notFound();
+	const products = serializeProducts(
+		selected.length
+			? selected
+			: defaultProductsForDesignation(row.designation),
+	);
 	await c.env.DB.prepare(`UPDATE users SET products = ? WHERE id = ?`)
 		.bind(products, id)
 		.run();
+	return c.redirect("/users");
+});
+
+app.post("/users/:id/designation", async (c) => {
+	if (!canManageUsers(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const rawRole = String(form.role || "").trim();
+	if (!isValidUserRole(rawRole)) return c.text("Invalid designation", 400);
+
+	const row = await c.env.DB.prepare(
+		`SELECT id, role, COALESCE(active, 1) AS active FROM users WHERE id = ?`,
+	)
+		.bind(id)
+		.first<{ id: string; role: string; active: number }>();
+	if (!row) return c.notFound();
+
+	const nextPermission = permissionRoleFor(rawRole);
+	const wasOwner = row.role === "owner";
+	const willBeOwner = nextPermission === "owner";
+
+	if (willBeOwner && !wasOwner) {
+		const seats = await countActiveOwners(c.env.DB);
+		if (seats >= SUPER_ADMIN_SEAT_LIMIT) {
+			return c.text(
+				`Super Admin / Owner seats full (${seats}/${SUPER_ADMIN_SEAT_LIMIT}).`,
+				400,
+			);
+		}
+	}
+	if (wasOwner && !willBeOwner && row.active === 1) {
+		const remaining = await countActiveOwners(c.env.DB, id);
+		if (remaining < 1) {
+			return c.text(
+				"Cannot demote the last active Super Admin / Owner.",
+				400,
+			);
+		}
+	}
+
+	await c.env.DB.prepare(
+		`UPDATE users SET role = ?, designation = ? WHERE id = ?`,
+	)
+		.bind(nextPermission, rawRole, id)
+		.run();
+	return c.redirect("/users");
+});
+
+app.post("/users/:id/active", async (c) => {
+	if (!canManageUsers(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const me = c.get("user")!;
+	const form = await c.req.parseBody();
+	const nextActive = String(form.active || "") === "1" ? 1 : 0;
+
+	const row = await c.env.DB.prepare(
+		`SELECT id, role, COALESCE(active, 1) AS active FROM users WHERE id = ?`,
+	)
+		.bind(id)
+		.first<{ id: string; role: string; active: number }>();
+	if (!row) return c.notFound();
+
+	if (nextActive === 0) {
+		if (id === me.id) {
+			return c.text("You cannot deactivate your own account.", 400);
+		}
+		if (row.role === "owner" && row.active === 1) {
+			const remaining = await countActiveOwners(c.env.DB, id);
+			if (remaining < 1) {
+				return c.text(
+					"Cannot deactivate the last active Super Admin / Owner.",
+					400,
+				);
+			}
+		}
+		await c.env.DB.prepare(`UPDATE users SET active = 0 WHERE id = ?`)
+			.bind(id)
+			.run();
+		await destroySessionsForUser(c.env.DB, id);
+	} else {
+		if (row.role === "owner") {
+			const seats = await countActiveOwners(c.env.DB);
+			if (row.active !== 1 && seats >= SUPER_ADMIN_SEAT_LIMIT) {
+				return c.text(
+					`Super Admin / Owner seats full (${seats}/${SUPER_ADMIN_SEAT_LIMIT}).`,
+					400,
+				);
+			}
+		}
+		await c.env.DB.prepare(`UPDATE users SET active = 1 WHERE id = ?`)
+			.bind(id)
+			.run();
+	}
 	return c.redirect("/users");
 });
 
@@ -1772,7 +1930,7 @@ app.get("/leads", async (c) => {
 			}>();
 
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const today = new Date().toISOString().slice(0, 10);
@@ -2013,7 +2171,7 @@ app.get("/jobs", async (c) => {
 			}>();
 
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const rows =
@@ -2242,7 +2400,7 @@ app.get("/jobs/new", async (c) => {
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const options =
@@ -2535,7 +2693,7 @@ app.get("/jobs/:id", async (c) => {
 			: "";
 
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const checklist = await c.env.DB.prepare(
@@ -4621,7 +4779,7 @@ app.get("/recurring", async (c) => {
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const rows =
@@ -4979,7 +5137,7 @@ app.get("/print/new", async (c) => {
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 
 	const customerOptions =
@@ -5115,7 +5273,7 @@ app.get("/print/:id", async (c) => {
 	if (!job) return c.notFound();
 
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string; role: string }>();
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers ORDER BY name COLLATE NOCASE`,

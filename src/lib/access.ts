@@ -33,14 +33,22 @@ export function serializeProducts(products: ProductKey[]): string {
 	return ALL_PRODUCTS.filter((p) => products.includes(p)).join(",");
 }
 
-/** Read product_* checkboxes from a parsed form body. */
-export function productsFromForm(form: Record<string, unknown>): ProductKey[] {
+/** Read product_* checkboxes from a parsed form body. Empty → []. */
+export function productsSelectedFromForm(
+	form: Record<string, unknown>,
+): ProductKey[] {
 	const selected: ProductKey[] = [];
 	for (const p of ALL_PRODUCTS) {
 		const key = `product_${p}`;
 		const v = form[key];
 		if (v === "on" || v === "1" || v === "true" || v === p) selected.push(p);
 	}
+	return selected;
+}
+
+/** Read product_* checkboxes; if none checked, fall back to all products. */
+export function productsFromForm(form: Record<string, unknown>): ProductKey[] {
+	const selected = productsSelectedFromForm(form);
 	return selected.length ? selected : [...ALL_PRODUCTS];
 }
 

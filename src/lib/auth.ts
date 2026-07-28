@@ -14,6 +14,7 @@ export type AppUser = {
 	designation: string;
 	products: ProductKey[];
 	mustChangePassword: boolean;
+	active: boolean;
 };
 
 const SESSION_COOKIE = "lumanyi_session";
@@ -29,10 +30,18 @@ export async function ensureSeedUser(db: D1Database): Promise<void> {
 	const passwordHash = await hashPassword("Lumanyi1!");
 	await db
 		.prepare(
-			`INSERT INTO users (id, email, name, password_hash, role, must_change_password)
-       VALUES (?, ?, ?, ?, ?, 0)`,
+			`INSERT INTO users (id, email, name, password_hash, role, designation, products, must_change_password, active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)`,
 		)
-		.bind(id, "owner@lumanyi.local", "Owner", passwordHash, "owner")
+		.bind(
+			id,
+			"owner@lumanyi.local",
+			"Owner",
+			passwordHash,
+			"owner",
+			"owner",
+			"restoration,floors,print",
+		)
 		.run();
 }
 
@@ -78,7 +87,9 @@ export async function getSessionUser(
 			`SELECT u.id, u.email, u.name, u.role,
         COALESCE(u.designation, u.role) AS designation,
         u.products,
-        u.must_change_password, s.expires_at
+        u.must_change_password,
+        COALESCE(u.active, 1) AS active,
+        s.expires_at
      FROM sessions s
      JOIN users u ON u.id = s.user_id
      WHERE s.id = ?`,
@@ -92,11 +103,16 @@ export async function getSessionUser(
 			designation: string;
 			products: string | null;
 			must_change_password: number;
+			active: number;
 			expires_at: string;
 		}>();
 
 	if (!row) return null;
 	if (new Date(row.expires_at) < new Date()) {
+		await db.prepare("DELETE FROM sessions WHERE id = ?").bind(sessionId).run();
+		return null;
+	}
+	if (row.active !== 1) {
 		await db.prepare("DELETE FROM sessions WHERE id = ?").bind(sessionId).run();
 		return null;
 	}
@@ -112,6 +128,7 @@ export async function getSessionUser(
 		designation: row.designation || permissionRole,
 		products: parseProducts(row.products),
 		mustChangePassword: row.must_change_password === 1,
+		active: true,
 	};
 }
 
@@ -121,6 +138,38 @@ export async function destroySession(
 ): Promise<void> {
 	if (!sessionId) return;
 	await db.prepare("DELETE FROM sessions WHERE id = ?").bind(sessionId).run();
+}
+
+/** Kill all sessions for a user (deactivate / offboarding). */
+export async function destroySessionsForUser(
+	db: D1Database,
+	userId: string,
+): Promise<void> {
+	await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId).run();
+}
+
+/** Active Super Admin seats (permission role = owner). */
+export async function countActiveOwners(
+	db: D1Database,
+	exceptUserId?: string,
+): Promise<number> {
+	if (exceptUserId) {
+		const row = await db
+			.prepare(
+				`SELECT COUNT(*) AS c FROM users
+         WHERE role = 'owner' AND COALESCE(active, 1) = 1 AND id != ?`,
+			)
+			.bind(exceptUserId)
+			.first<{ c: number }>();
+		return row?.c ?? 0;
+	}
+	const row = await db
+		.prepare(
+			`SELECT COUNT(*) AS c FROM users
+       WHERE role = 'owner' AND COALESCE(active, 1) = 1`,
+		)
+		.first<{ c: number }>();
+	return row?.c ?? 0;
 }
 
 export { SESSION_COOKIE };
