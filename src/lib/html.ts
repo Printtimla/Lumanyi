@@ -10,6 +10,7 @@ import { canViewAudit } from "./audit";
 import { canManagePriceLists } from "./price-list";
 import { canManagePrintMargins } from "./print-margins";
 import { canManageLaborRates } from "./labor-rates";
+import { canManageDiscountCaps } from "./discount-caps";
 
 export function escapeHtml(value: string | number | null | undefined): string {
 	return String(value ?? "")
@@ -64,6 +65,9 @@ export function layout(opts: {
 		}
 		if (canManageLaborRates(u)) {
 			items.push({ href: "/settings/labor-rates", label: "Labor rates" });
+		}
+		if (canManageDiscountCaps(u)) {
+			items.push({ href: "/settings/discount-caps", label: "Discount caps" });
 		}
 		items.push({ href: "/inventory", label: "Inventory" });
 		if (canSeeOfficeTools(u)) {

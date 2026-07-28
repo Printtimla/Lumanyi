@@ -173,6 +173,13 @@ import {
 	parseLaborRateForm,
 } from "./lib/labor-rates";
 import {
+	canManageDiscountCaps,
+	discountCapNoticeHtml,
+	getDiscountCapSettings,
+	parseDiscountCapForm,
+	summarizeDiscountCaps,
+} from "./lib/discount-caps";
+import {
 	canSetAssetStatusWithOpenAssignment,
 	canVoidClaimData,
 	normalizeVoidReason,
@@ -2133,6 +2140,80 @@ app.post("/settings/labor-rates", async (c) => {
 		},
 	});
 	return c.redirect("/settings/labor-rates");
+});
+
+app.get("/settings/discount-caps", async (c) => {
+	if (!canManageDiscountCaps(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Discount caps are Super Admin / Owner only."),
+			403,
+		);
+	}
+	const settings = await getDiscountCapSettings(c.env.DB);
+	const body = `
+    <p><a href="/settings/labor-rates">← Labor rates</a> · <a href="/settings/price-lists">Price lists</a></p>
+    <h1>Discount / write-off caps</h1>
+    <p class="muted">Owner policy for future discount &amp; write-off UI. <strong>Not enforced yet</strong> — no discount apply path exists.
+      These numbers are shown on estimates and print quotes so staff know the rules when that UI ships.</p>
+    <p class="muted">Current: ${escapeHtml(summarizeDiscountCaps(settings))}</p>
+    <form method="post" action="/settings/discount-caps" class="panel stack">
+      <div class="row">
+        <div><label for="max_discount_pct">Max discount %</label>
+          <input id="max_discount_pct" name="max_discount_pct" type="number" step="0.1" min="0" max="100"
+            required value="${escapeHtml(settings.max_discount_pct)}" /></div>
+        <div><label for="max_writeoff_dollars">Max write-off ($)</label>
+          <input id="max_writeoff_dollars" name="max_writeoff_dollars" type="number" step="0.01" min="0"
+            required value="${escapeHtml((settings.max_writeoff_cents / 100).toFixed(2))}" /></div>
+        <div><label for="owner_approval_pct">Owner approval at ≥ %</label>
+          <input id="owner_approval_pct" name="owner_approval_pct" type="number" step="0.1" min="0" max="100"
+            required value="${escapeHtml(settings.owner_approval_pct)}"
+            title="Discounts at or above this % will require Owner approval when discount UI ships" /></div>
+      </div>
+      <p class="muted" style="margin:0;font-size:0.85rem">Use 0 to mean “unset / not limited” for that field until you choose a real cap.</p>
+      <button class="btn" type="submit">Save discount caps</button>
+    </form>`;
+	return c.html(page(c, "Discount caps", body));
+});
+
+app.post("/settings/discount-caps", async (c) => {
+	if (!canManageDiscountCaps(c.get("user")!)) return c.text("Forbidden", 403);
+	const form = await c.req.parseBody();
+	const parsed = parseDiscountCapForm(form as Record<string, unknown>);
+	if (!parsed.ok) return c.text(parsed.error, 400);
+	const before = await getDiscountCapSettings(c.env.DB);
+	await c.env.DB.prepare(
+		`INSERT INTO discount_cap_settings (
+      id, max_discount_pct, max_writeoff_cents, owner_approval_pct, updated_at, updated_by
+    ) VALUES ('default', ?, ?, ?, datetime('now'), ?)
+    ON CONFLICT(id) DO UPDATE SET
+      max_discount_pct = excluded.max_discount_pct,
+      max_writeoff_cents = excluded.max_writeoff_cents,
+      owner_approval_pct = excluded.owner_approval_pct,
+      updated_at = datetime('now'),
+      updated_by = excluded.updated_by`,
+	)
+		.bind(
+			parsed.max_discount_pct,
+			parsed.max_writeoff_cents,
+			parsed.owner_approval_pct,
+			c.get("user")!.id,
+		)
+		.run();
+	await recordAudit(c, {
+		action: "discount_cap_update",
+		entityType: "discount_cap_settings",
+		entityId: "default",
+		summary: "Updated discount / write-off caps",
+		detail: {
+			before: {
+				max_discount_pct: before.max_discount_pct,
+				max_writeoff_cents: before.max_writeoff_cents,
+				owner_approval_pct: before.owner_approval_pct,
+			},
+			after: parsed,
+		},
+	});
+	return c.redirect("/settings/discount-caps");
 });
 
 app.get("/", async (c) => {
@@ -4616,6 +4697,7 @@ app.get("/jobs/:id/estimate", async (c) => {
 		fromPriceId && priceItems.find((p) => p.id === fromPriceId)
 			? priceItems.find((p) => p.id === fromPriceId)!
 			: null;
+	const discountCaps = await getDiscountCapSettings(c.env.DB);
 
 	const roomRows =
 		rooms.results
@@ -4711,6 +4793,8 @@ app.get("/jobs/:id/estimate", async (c) => {
         <div><span class="muted">Estimate total</span><br><strong>${escapeHtml(money(job.estimate_cents))}</strong></div>
       </div>
       <p class="muted" style="margin:0">Edit claim fields on the job page. Line totals sync to the job estimate.</p>
+      <p class="muted" style="margin:0;font-size:0.85rem">${escapeHtml(discountCapNoticeHtml(discountCaps))}
+        ${canManageDiscountCaps(c.get("user")!) ? ` <a href="/settings/discount-caps">Edit caps</a>` : ""}</p>
     </div>
 
     <h2>Rooms / areas</h2>
@@ -6470,6 +6554,7 @@ app.get("/print/:id", async (c) => {
 		}>();
 
 	const marginSettings = await getPrintMarginSettings(c.env.DB);
+	const discountCaps = await getDiscountCapSettings(c.env.DB);
 
 	const statusOptions = PRINT_STATUSES.map(
 		(s) =>
@@ -6679,6 +6764,8 @@ app.get("/print/:id", async (c) => {
     <h2>Quote lines</h2>
     <p class="muted">Owner margin rules: ${escapeHtml(summarizeMarginSettings(marginSettings))}
       ${canManagePrintMargins(user) ? `· <a href="/settings/print-margins">Edit</a>` : ""}</p>
+    <p class="muted" style="font-size:0.85rem">${escapeHtml(discountCapNoticeHtml(discountCaps))}
+      ${canManageDiscountCaps(user) ? ` <a href="/settings/discount-caps">Edit caps</a>` : ""}</p>
     <table>
       <thead><tr><th>Description</th><th>Qty</th><th>Unit cost</th><th>Unit $</th><th>Total</th><th></th></tr></thead>
       <tbody>${lineRows}</tbody>
