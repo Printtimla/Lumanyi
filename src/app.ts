@@ -1010,16 +1010,43 @@ app.get("/jobs/new", async (c) => {
 			? "Lobby hard floor clean"
 			: "Kitchen flood mitigation";
 
+	const customerCount = customers.results?.length ?? 0;
+	const customerBlock =
+		customerCount > 0
+			? `<div>
+        <label for="customer_id">Existing customer</label>
+        <select id="customer_id" name="customer_id">
+          <option value="">Select…</option>
+          ${options}
+        </select>
+      </div>
+      <p class="muted" style="margin:0">Or create a new customer below (leave select blank).</p>`
+			: `<div class="flash" style="margin:0">
+        No customers yet — add one below to create this job.
+        You can also manage customers from
+        <a href="/customers/new">Customers → Add</a>.
+      </div>`;
+
 	const body = `
     <h1>${escapeHtml(heading)}</h1>
     <form method="post" action="/jobs" class="panel stack">
       ${product ? `<input type="hidden" name="product" value="${escapeHtml(product)}" />` : ""}
-      <div>
-        <label for="customer_id">Customer</label>
-        <select id="customer_id" name="customer_id" required>
-          <option value="">Select…</option>
-          ${options}
-        </select>
+      ${customerBlock}
+      <div class="row">
+        <div><label for="new_customer_name">New customer name</label>
+          <input id="new_customer_name" name="new_customer_name" ${customerCount === 0 ? "required" : ""} placeholder="Acme Property Mgmt" /></div>
+        <div><label for="new_customer_phone">Phone</label>
+          <input id="new_customer_phone" name="new_customer_phone" placeholder="916-555-0100" /></div>
+      </div>
+      <div class="row">
+        <div><label for="new_site_address">Job site address</label>
+          <input id="new_site_address" name="new_site_address" placeholder="123 Main St" ${customerCount === 0 ? "required" : ""} /></div>
+        <div><label for="new_site_city">City</label>
+          <input id="new_site_city" name="new_site_city" placeholder="Sacramento" ${customerCount === 0 ? "required" : ""} /></div>
+        <div><label for="new_site_state">State</label>
+          <input id="new_site_state" name="new_site_state" value="CA" /></div>
+        <div><label for="new_site_zip">ZIP</label>
+          <input id="new_site_zip" name="new_site_zip" /></div>
       </div>
       <div><label for="title">Title</label><input id="title" name="title" required placeholder="${escapeHtml(placeholder)}" /></div>
       <div class="row">
@@ -1059,18 +1086,76 @@ app.get("/jobs/new", async (c) => {
 
 app.post("/jobs", async (c) => {
 	const form = await c.req.parseBody();
-	const customerId = String(form.customer_id || "");
+	let customerId = String(form.customer_id || "").trim();
+	const newCustomerName = String(form.new_customer_name || "").trim();
 	const rawType = String(form.job_type || "");
 	if (!isValidFieldJobType(rawType)) {
 		return c.text("Invalid job type", 400);
 	}
 	const jobType = normalizeJobType(rawType);
 
-	const site = await c.env.DB.prepare(
-		`SELECT id FROM sites WHERE customer_id = ? ORDER BY created_at LIMIT 1`,
-	)
-		.bind(customerId)
-		.first<{ id: string }>();
+	const stmts: D1PreparedStatement[] = [];
+	let siteId: string | null = null;
+
+	if (!customerId) {
+		if (!newCustomerName) {
+			return c.text(
+				"Pick an existing customer or enter a new customer name.",
+				400,
+			);
+		}
+		customerId = newId("cus");
+		siteId = newId("sit");
+		const address = String(form.new_site_address || "").trim() || "TBD";
+		const city = String(form.new_site_city || "").trim() || "TBD";
+		const state = String(form.new_site_state || "CA").trim() || "CA";
+		stmts.push(
+			c.env.DB.prepare(
+				`INSERT INTO customers (id, name, phone, email, notes) VALUES (?, ?, ?, NULL, NULL)`,
+			).bind(
+				customerId,
+				newCustomerName,
+				String(form.new_customer_phone || "").trim() || null,
+			),
+			c.env.DB.prepare(
+				`INSERT INTO sites (id, customer_id, label, address_line1, address_line2, city, state, postal_code)
+         VALUES (?, ?, 'Primary', ?, NULL, ?, ?, ?)`,
+			).bind(
+				siteId,
+				customerId,
+				address,
+				city,
+				state,
+				String(form.new_site_zip || "").trim() || null,
+			),
+		);
+	} else {
+		const site = await c.env.DB.prepare(
+			`SELECT id FROM sites WHERE customer_id = ? ORDER BY created_at LIMIT 1`,
+		)
+			.bind(customerId)
+			.first<{ id: string }>();
+		siteId = site?.id ?? null;
+
+		// Optional: attach a new site address when creating job for existing customer
+		const address = String(form.new_site_address || "").trim();
+		if (address) {
+			siteId = newId("sit");
+			stmts.push(
+				c.env.DB.prepare(
+					`INSERT INTO sites (id, customer_id, label, address_line1, address_line2, city, state, postal_code)
+           VALUES (?, ?, 'Job site', ?, NULL, ?, ?, ?)`,
+				).bind(
+					siteId,
+					customerId,
+					address,
+					String(form.new_site_city || "").trim() || "TBD",
+					String(form.new_site_state || "CA").trim() || "CA",
+					String(form.new_site_zip || "").trim() || null,
+				),
+			);
+		}
+	}
 
 	const jobId = newId("job");
 	const estimateRaw = String(form.estimate_dollars || "").trim();
@@ -1078,7 +1163,7 @@ app.post("/jobs", async (c) => {
 		? Math.round(parseFloat(estimateRaw) * 100)
 		: null;
 
-	const stmts = [
+	stmts.push(
 		c.env.DB.prepare(
 			`INSERT INTO jobs (
         id, customer_id, site_id, title, job_type, status,
@@ -1087,7 +1172,7 @@ app.post("/jobs", async (c) => {
 		).bind(
 			jobId,
 			customerId,
-			site?.id ?? null,
+			siteId,
 			String(form.title || "").trim(),
 			jobType,
 			String(form.status || "lead"),
@@ -1097,7 +1182,7 @@ app.post("/jobs", async (c) => {
 			String(form.notes || "").trim() || null,
 			String(form.assigned_user_id || "").trim() || null,
 		),
-	];
+	);
 
 	checklistFor(jobType).forEach((label, i) => {
 		stmts.push(
