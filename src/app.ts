@@ -37,10 +37,16 @@ import {
 	FLOOR_TYPE_VALUES,
 	PRODUCTS,
 	RESTORATION_TYPES,
+	isRestorationType,
 	isValidFieldJobType,
 	jobTypeLabel,
 	normalizeJobType,
 } from "./lib/products";
+import {
+	EQUIPMENT_TYPES,
+	equipmentTypeLabel,
+	type FieldLogRow,
+} from "./lib/field-logs";
 
 const RESTORATION_SQL_TYPES = [
 	...RESTORATION_TYPES.map((t) => t.value),
@@ -1212,6 +1218,113 @@ app.get("/jobs/:id", async (c) => {
 			)
 			.join("") || `<p class="muted">No photos yet.</p>`;
 
+	const isRestoration = isRestorationType(job.job_type);
+	let fieldLogSection = "";
+	if (isRestoration) {
+		const logs = await c.env.DB.prepare(
+			`SELECT l.id, l.kind, l.logged_at, l.area, l.reading, l.equipment_type,
+        l.equipment_count, l.notes, l.created_at, u.name AS user_name
+       FROM job_field_logs l
+       LEFT JOIN users u ON u.id = l.created_by
+       WHERE l.job_id = ?
+       ORDER BY l.logged_at DESC, l.created_at DESC`,
+		)
+			.bind(id)
+			.all<FieldLogRow>();
+
+		const today = new Date().toISOString().slice(0, 10);
+		const equipmentOptions = EQUIPMENT_TYPES.map(
+			(t) =>
+				`<option value="${escapeHtml(t.value)}">${escapeHtml(t.label)}</option>`,
+		).join("");
+
+		const moistureRows =
+			logs.results
+				?.filter((l) => l.kind === "moisture")
+				.map(
+					(l) => `<tr>
+            <td>${escapeHtml(l.logged_at.slice(0, 10))}</td>
+            <td>${escapeHtml(l.area) || "—"}</td>
+            <td>${escapeHtml(l.reading) || "—"}</td>
+            <td>${escapeHtml(l.notes) || "—"}</td>
+            <td class="muted">${escapeHtml(l.user_name) || "—"}</td>
+            <td>
+              <form method="post" action="/jobs/${escapeHtml(id)}/logs/${escapeHtml(l.id)}/delete" class="inline"
+                onsubmit="return confirm('Delete this reading?');">
+                <button class="linkish" type="submit">Delete</button>
+              </form>
+            </td>
+          </tr>`,
+				)
+				.join("") ||
+			`<tr><td colspan="6" class="muted">No moisture readings yet.</td></tr>`;
+
+		const equipmentRows =
+			logs.results
+				?.filter((l) => l.kind === "equipment")
+				.map(
+					(l) => `<tr>
+            <td>${escapeHtml(l.logged_at.slice(0, 10))}</td>
+            <td>${escapeHtml(l.area) || "—"}</td>
+            <td>${escapeHtml(equipmentTypeLabel(l.equipment_type))}</td>
+            <td>${l.equipment_count != null ? escapeHtml(l.equipment_count) : "—"}</td>
+            <td>${escapeHtml(l.notes) || "—"}</td>
+            <td class="muted">${escapeHtml(l.user_name) || "—"}</td>
+            <td>
+              <form method="post" action="/jobs/${escapeHtml(id)}/logs/${escapeHtml(l.id)}/delete" class="inline"
+                onsubmit="return confirm('Delete this equipment entry?');">
+                <button class="linkish" type="submit">Delete</button>
+              </form>
+            </td>
+          </tr>`,
+				)
+				.join("") ||
+			`<tr><td colspan="7" class="muted">No equipment logged yet.</td></tr>`;
+
+		fieldLogSection = `
+    <h2>Moisture readings</h2>
+    <p class="muted">Restoration jobs only — room/area readings over time.</p>
+    <form method="post" action="/jobs/${escapeHtml(id)}/logs/moisture" class="panel stack" style="margin-bottom:1rem">
+      <div class="row">
+        <div><label for="m_logged_at">Date</label>
+          <input id="m_logged_at" name="logged_at" type="date" required value="${escapeHtml(today)}" /></div>
+        <div><label for="m_area">Room / area</label>
+          <input id="m_area" name="area" required placeholder="Kitchen — NW wall" /></div>
+        <div><label for="m_reading">Reading</label>
+          <input id="m_reading" name="reading" required placeholder="18% or 0.45" /></div>
+      </div>
+      <div><label for="m_notes">Notes</label>
+        <input id="m_notes" name="notes" placeholder="Meter, material, ambient RH…" /></div>
+      <button class="btn" type="submit">Add moisture reading</button>
+    </form>
+    <table>
+      <thead><tr><th>Date</th><th>Area</th><th>Reading</th><th>Notes</th><th>By</th><th></th></tr></thead>
+      <tbody>${moistureRows}</tbody>
+    </table>
+
+    <h2>Equipment log</h2>
+    <p class="muted">Air movers, dehumidifiers, and other drying equipment on site.</p>
+    <form method="post" action="/jobs/${escapeHtml(id)}/logs/equipment" class="panel stack" style="margin-bottom:1rem">
+      <div class="row">
+        <div><label for="e_logged_at">Date</label>
+          <input id="e_logged_at" name="logged_at" type="date" required value="${escapeHtml(today)}" /></div>
+        <div><label for="e_area">Room / area</label>
+          <input id="e_area" name="area" placeholder="Living room" /></div>
+        <div><label for="e_type">Equipment</label>
+          <select id="e_type" name="equipment_type" required>${equipmentOptions}</select></div>
+        <div><label for="e_count">Count</label>
+          <input id="e_count" name="equipment_count" type="number" min="1" step="1" value="1" required /></div>
+      </div>
+      <div><label for="e_notes">Notes</label>
+        <input id="e_notes" name="notes" placeholder="Serial, placement, power…" /></div>
+      <button class="btn" type="submit">Log equipment</button>
+    </form>
+    <table>
+      <thead><tr><th>Date</th><th>Area</th><th>Type</th><th>Count</th><th>Notes</th><th>By</th><th></th></tr></thead>
+      <tbody>${equipmentRows}</tbody>
+    </table>`;
+	}
+
 	const statusOptions = [
 		"lead",
 		"estimate",
@@ -1314,6 +1427,8 @@ app.get("/jobs/:id", async (c) => {
     <h2>Checklist</h2>
     <div class="panel"><ul class="checklist">${checkItems}</ul></div>
 
+    ${fieldLogSection}
+
     <h2>Field notes</h2>
     <form method="post" action="/jobs/${escapeHtml(id)}/notes" class="panel stack" style="margin-bottom:1rem">
       <textarea name="body" required placeholder="Photos taken, moisture readings, customer instructions…"></textarea>
@@ -1365,6 +1480,117 @@ app.post("/jobs/:id", async (c) => {
 			String(form.date_of_loss || "").trim() || null,
 			id,
 		)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+async function requireRestorationJob(
+	db: D1Database,
+	jobId: string,
+): Promise<{ id: string } | Response> {
+	const job = await db
+		.prepare(`SELECT id, job_type FROM jobs WHERE id = ?`)
+		.bind(jobId)
+		.first<{ id: string; job_type: string }>();
+	if (!job) {
+		return new Response("Not found", { status: 404 });
+	}
+	if (!isRestorationType(job.job_type)) {
+		return new Response("Moisture / equipment logs are for restoration jobs only", {
+			status: 400,
+		});
+	}
+	return { id: job.id };
+}
+
+app.post("/jobs/:id/logs/moisture", async (c) => {
+	const id = c.req.param("id");
+	const gate = await requireRestorationJob(c.env.DB, id);
+	if (gate instanceof Response) return gate;
+
+	const form = await c.req.parseBody();
+	const loggedAt = String(form.logged_at || "").slice(0, 10);
+	const area = String(form.area || "").trim();
+	const reading = String(form.reading || "").trim();
+	if (!loggedAt || !area || !reading) {
+		return c.text("Date, area, and reading required", 400);
+	}
+
+	await c.env.DB.prepare(
+		`INSERT INTO job_field_logs (
+      id, job_id, kind, logged_at, area, reading, notes, created_by
+    ) VALUES (?, ?, 'moisture', ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			newId("flog"),
+			id,
+			loggedAt,
+			area,
+			reading,
+			String(form.notes || "").trim() || null,
+			c.get("user").id,
+		)
+		.run();
+	await c.env.DB.prepare(
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/logs/equipment", async (c) => {
+	const id = c.req.param("id");
+	const gate = await requireRestorationJob(c.env.DB, id);
+	if (gate instanceof Response) return gate;
+
+	const form = await c.req.parseBody();
+	const loggedAt = String(form.logged_at || "").slice(0, 10);
+	const equipmentType = String(form.equipment_type || "");
+	const count = Number(form.equipment_count || 0);
+	if (
+		!loggedAt ||
+		!EQUIPMENT_TYPES.some((t) => t.value === equipmentType) ||
+		!Number.isFinite(count) ||
+		count < 1
+	) {
+		return c.text("Date, equipment type, and count required", 400);
+	}
+
+	await c.env.DB.prepare(
+		`INSERT INTO job_field_logs (
+      id, job_id, kind, logged_at, area, equipment_type, equipment_count, notes, created_by
+    ) VALUES (?, ?, 'equipment', ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			newId("flog"),
+			id,
+			loggedAt,
+			String(form.area || "").trim() || null,
+			equipmentType,
+			count,
+			String(form.notes || "").trim() || null,
+			c.get("user").id,
+		)
+		.run();
+	await c.env.DB.prepare(
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/logs/:logId/delete", async (c) => {
+	const id = c.req.param("id");
+	const logId = c.req.param("logId");
+	const gate = await requireRestorationJob(c.env.DB, id);
+	if (gate instanceof Response) return gate;
+
+	await c.env.DB.prepare(
+		`DELETE FROM job_field_logs WHERE id = ? AND job_id = ?`,
+	)
+		.bind(logId, id)
 		.run();
 	return c.redirect(`/jobs/${id}`);
 });
