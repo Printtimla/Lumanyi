@@ -52,6 +52,7 @@ import {
 import {
 	EQUIPMENT_TYPES,
 	equipmentTypeLabel,
+	resolveGrains,
 	type FieldLogRow,
 } from "./lib/field-logs";
 import { csvResponse } from "./lib/csv";
@@ -2198,8 +2199,9 @@ app.get("/jobs/:id", async (c) => {
         <div><label for="m_rh_pct">RH (%)</label>
           <input id="m_rh_pct" name="rh_pct" type="number" step="0.1" min="0" max="100" placeholder="optional" /></div>
         <div><label for="m_grains">Grains (GPP)</label>
-          <input id="m_grains" name="grains" type="number" step="0.1" min="0" placeholder="optional" /></div>
+          <input id="m_grains" name="grains" type="number" step="0.1" min="0" placeholder="auto from temp+RH" /></div>
       </div>
+      <p class="muted" style="margin:0;font-size:0.85rem">Grains auto-fills from temp + RH when left blank (sea-level approx). Enter a value to override. Helper only — not an S500 compliance claim.</p>
       <div><label for="m_notes">Notes</label>
         <input id="m_notes" name="notes" placeholder="Meter, material, class of water…" /></div>
       <button class="btn" type="submit">Add moisture reading</button>
@@ -2687,6 +2689,10 @@ app.post("/jobs/:id/logs/moisture", async (c) => {
 		return c.text("Date, area, and reading required", 400);
 	}
 
+	const tempF = parseOptionalNumber(form.temp_f);
+	const rhPct = parseOptionalNumber(form.rh_pct);
+	const grains = resolveGrains(tempF, rhPct, parseOptionalNumber(form.grains));
+
 	await c.env.DB.prepare(
 		`INSERT INTO job_field_logs (
       id, job_id, kind, logged_at, area, reading, temp_f, rh_pct, grains, notes, created_by
@@ -2698,9 +2704,9 @@ app.post("/jobs/:id/logs/moisture", async (c) => {
 			loggedAt,
 			area,
 			reading,
-			parseOptionalNumber(form.temp_f),
-			parseOptionalNumber(form.rh_pct),
-			parseOptionalNumber(form.grains),
+			tempF,
+			rhPct,
+			grains,
 			String(form.notes || "").trim() || null,
 			c.get("user")!.id,
 		)
