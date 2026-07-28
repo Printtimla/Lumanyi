@@ -12,7 +12,11 @@ export type AuditAction =
 	| "user_deactivate"
 	| "user_reactivate"
 	| "user_designation"
-	| "user_products";
+	| "user_products"
+	| "price_list_create"
+	| "price_list_update"
+	| "price_list_deactivate"
+	| "price_list_reactivate";
 
 export type AuditEntityType =
 	| "customer"
@@ -21,7 +25,8 @@ export type AuditEntityType =
 	| "field_log"
 	| "job_photo"
 	| "moisture_map"
-	| "user";
+	| "user"
+	| "price_list_item";
 
 export type AuditEventInput = {
 	actorUserId: string | null;

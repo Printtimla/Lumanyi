@@ -44,6 +44,7 @@ import {
 	isValidFieldJobType,
 	jobTypeLabel,
 	normalizeJobType,
+	productForJobType,
 	type ProductKey,
 } from "./lib/products";
 import {
@@ -142,6 +143,17 @@ import {
 	type AuditAction,
 	type AuditEntityType,
 } from "./lib/audit";
+import {
+	canManagePriceLists,
+	centsToDollarsInput,
+	getPriceItem,
+	listActivePriceItemsForProduct,
+	listPriceItems,
+	parsePriceListForm,
+	priceListCategoryLabel,
+	priceListProductLabel,
+	PRICE_LIST_PRODUCTS,
+} from "./lib/price-list";
 import {
 	canSetAssetStatusWithOpenAssignment,
 	canVoidClaimData,
@@ -1642,13 +1654,277 @@ app.get("/audit", async (c) => {
 
 	const body = `
     <h1>Audit log</h1>
-    <p class="muted">Append-only ledger of Super Admin governance actions (soft/hard delete, restore, void, user create/deactivate/role/products).
+    <p class="muted">Append-only ledger of Super Admin governance actions (soft/hard delete, restore, void, user create/deactivate/role/products, price lists).
       Rows cannot be edited or deleted — even by Owners. Showing latest 200.</p>
     <table>
       <thead><tr><th>When (UTC)</th><th>Actor</th><th>Action</th><th>Entity</th><th>Summary</th><th>IP / Request</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 	return c.html(page(c, "Audit", body));
+});
+
+app.get("/settings/price-lists", async (c) => {
+	if (!canManagePriceLists(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Price lists are Super Admin / Owner only."),
+			403,
+		);
+	}
+	const productFilter = String(c.req.query("product") || "");
+	const showInactive = c.req.query("inactive") === "1";
+	const items = await listPriceItems(c.env.DB, {
+		product:
+			productFilter === "restoration" || productFilter === "floors"
+				? productFilter
+				: "",
+		activeOnly: !showInactive,
+	});
+
+	const filterLinks = [
+		{ href: "/settings/price-lists", label: "All active", on: !productFilter && !showInactive },
+		{
+			href: "/settings/price-lists?product=restoration",
+			label: "Mitigation",
+			on: productFilter === "restoration" && !showInactive,
+		},
+		{
+			href: "/settings/price-lists?product=floors",
+			label: "Floors",
+			on: productFilter === "floors" && !showInactive,
+		},
+		{
+			href: "/settings/price-lists?inactive=1",
+			label: "Include inactive",
+			on: showInactive && !productFilter,
+		},
+	]
+		.map(
+			(l) =>
+				`<a href="${l.href}"${l.on ? ' style="font-weight:700"' : ""}>${escapeHtml(l.label)}</a>`,
+		)
+		.join(" · ");
+
+	const categoryOptions = COST_CATEGORIES.map(
+		(cat) =>
+			`<option value="${escapeHtml(cat.value)}">${escapeHtml(cat.label)}</option>`,
+	).join("");
+	const productOptions = PRICE_LIST_PRODUCTS.map(
+		(p) =>
+			`<option value="${escapeHtml(p.value)}">${escapeHtml(p.label)}</option>`,
+	).join("");
+
+	const rows =
+		items
+			.map(
+				(item) => `<tr${item.active ? "" : ' style="opacity:0.55"'}>
+        <td>${escapeHtml(priceListProductLabel(item.product))}</td>
+        <td>${escapeHtml(priceListCategoryLabel(item.category))}</td>
+        <td><a href="/settings/price-lists/${escapeHtml(item.id)}">${escapeHtml(item.name)}</a>${item.active ? "" : " <span class=\"muted\">(inactive)</span>"}</td>
+        <td>${escapeHtml(item.unit)}</td>
+        <td>${escapeHtml(money(item.unit_cents))}</td>
+        <td class="muted">${escapeHtml(item.sort_order)}</td>
+      </tr>`,
+			)
+			.join("") ||
+		`<tr><td colspan="6" class="muted">No rates yet — add your first below. No seeded prices (Owner sets real rates).</td></tr>`;
+
+	const body = `
+    <h1>Price lists</h1>
+    <p class="muted">Owner rate matrix for mitigation and hard-floor estimates. Staff can pick a rate on the estimate form to prefill description, unit, and unit price.
+      Print margin rules and labor-rate tables are later SA-6 slices.</p>
+    <p>${filterLinks}</p>
+    <table>
+      <thead><tr><th>Product</th><th>Category</th><th>Name</th><th>Unit</th><th>Unit $</th><th>Sort</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <h2>Add rate</h2>
+    <form method="post" action="/settings/price-lists" class="panel stack">
+      <div class="row">
+        <div><label for="product">Product</label>
+          <select id="product" name="product" required>${productOptions}</select></div>
+        <div><label for="category">Category</label>
+          <select id="category" name="category" required>${categoryOptions}</select></div>
+        <div class="grow"><label for="name">Name</label>
+          <input id="name" name="name" required maxlength="200" placeholder="Air mover — daily" /></div>
+      </div>
+      <div class="row">
+        <div><label for="unit">Unit</label>
+          <input id="unit" name="unit" value="ea" required maxlength="32" /></div>
+        <div><label for="unit_dollars">Unit price ($)</label>
+          <input id="unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" required value="0" /></div>
+        <div><label for="sort_order">Sort</label>
+          <input id="sort_order" name="sort_order" type="number" step="1" value="0" /></div>
+      </div>
+      <div><label for="notes">Notes</label>
+        <input id="notes" name="notes" placeholder="Optional internal note" /></div>
+      <button class="btn" type="submit">Add to price list</button>
+    </form>`;
+	return c.html(page(c, "Price lists", body));
+});
+
+app.post("/settings/price-lists", async (c) => {
+	if (!canManagePriceLists(c.get("user")!)) return c.text("Forbidden", 403);
+	const form = await c.req.parseBody();
+	const parsed = parsePriceListForm(form as Record<string, unknown>);
+	if (!parsed.ok) return c.text(parsed.error, 400);
+	const id = newId("pli");
+	await c.env.DB.prepare(
+		`INSERT INTO price_list_items (
+      id, product, category, name, unit, unit_cents, active, sort_order, notes
+    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+	)
+		.bind(
+			id,
+			parsed.product,
+			parsed.category,
+			parsed.name,
+			parsed.unit,
+			parsed.unitCents,
+			parsed.sortOrder,
+			parsed.notes,
+		)
+		.run();
+	await recordAudit(c, {
+		action: "price_list_create",
+		entityType: "price_list_item",
+		entityId: id,
+		summary: `Created price list item ${parsed.name}`,
+		detail: {
+			product: parsed.product,
+			category: parsed.category,
+			unit: parsed.unit,
+			unit_cents: parsed.unitCents,
+		},
+	});
+	return c.redirect("/settings/price-lists");
+});
+
+app.get("/settings/price-lists/:id", async (c) => {
+	if (!canManagePriceLists(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Price lists are Super Admin / Owner only."),
+			403,
+		);
+	}
+	const id = c.req.param("id");
+	const item = await getPriceItem(c.env.DB, id);
+	if (!item) return c.notFound();
+
+	const categoryOptions = COST_CATEGORIES.map(
+		(cat) =>
+			`<option value="${escapeHtml(cat.value)}"${cat.value === item.category ? " selected" : ""}>${escapeHtml(cat.label)}</option>`,
+	).join("");
+	const productOptions = PRICE_LIST_PRODUCTS.map(
+		(p) =>
+			`<option value="${escapeHtml(p.value)}"${p.value === item.product ? " selected" : ""}>${escapeHtml(p.label)}</option>`,
+	).join("");
+
+	const activeForm = item.active
+		? `<form method="post" action="/settings/price-lists/${escapeHtml(id)}/active" class="inline"
+        onsubmit="return confirm('Deactivate this rate? It will hide from estimate pickers.');">
+        <input type="hidden" name="active" value="0" />
+        <button class="btn secondary" type="submit">Deactivate</button>
+      </form>`
+		: `<form method="post" action="/settings/price-lists/${escapeHtml(id)}/active" class="inline">
+        <input type="hidden" name="active" value="1" />
+        <button class="btn" type="submit">Reactivate</button>
+      </form>`;
+
+	const body = `
+    <p><a href="/settings/price-lists">← Price lists</a></p>
+    <h1>${escapeHtml(item.name)}</h1>
+    <p class="muted">${item.active ? "Active" : "Inactive"} · used as a default on estimates; line items stay editable after pick.</p>
+    <form method="post" action="/settings/price-lists/${escapeHtml(id)}" class="panel stack">
+      <div class="row">
+        <div><label for="product">Product</label>
+          <select id="product" name="product" required>${productOptions}</select></div>
+        <div><label for="category">Category</label>
+          <select id="category" name="category" required>${categoryOptions}</select></div>
+        <div class="grow"><label for="name">Name</label>
+          <input id="name" name="name" required maxlength="200" value="${escapeHtml(item.name)}" /></div>
+      </div>
+      <div class="row">
+        <div><label for="unit">Unit</label>
+          <input id="unit" name="unit" required maxlength="32" value="${escapeHtml(item.unit)}" /></div>
+        <div><label for="unit_dollars">Unit price ($)</label>
+          <input id="unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" required
+            value="${escapeHtml(centsToDollarsInput(item.unit_cents))}" /></div>
+        <div><label for="sort_order">Sort</label>
+          <input id="sort_order" name="sort_order" type="number" step="1" value="${escapeHtml(item.sort_order)}" /></div>
+      </div>
+      <div><label for="notes">Notes</label>
+        <input id="notes" name="notes" value="${escapeHtml(item.notes)}" /></div>
+      <button class="btn" type="submit">Save</button>
+    </form>
+    <div class="toolbar" style="margin-top:1rem">${activeForm}</div>`;
+	return c.html(page(c, item.name, body));
+});
+
+app.post("/settings/price-lists/:id", async (c) => {
+	if (!canManagePriceLists(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const existing = await getPriceItem(c.env.DB, id);
+	if (!existing) return c.notFound();
+	const form = await c.req.parseBody();
+	const parsed = parsePriceListForm(form as Record<string, unknown>);
+	if (!parsed.ok) return c.text(parsed.error, 400);
+	await c.env.DB.prepare(
+		`UPDATE price_list_items SET
+      product = ?, category = ?, name = ?, unit = ?, unit_cents = ?,
+      sort_order = ?, notes = ?, updated_at = datetime('now')
+     WHERE id = ?`,
+	)
+		.bind(
+			parsed.product,
+			parsed.category,
+			parsed.name,
+			parsed.unit,
+			parsed.unitCents,
+			parsed.sortOrder,
+			parsed.notes,
+			id,
+		)
+		.run();
+	await recordAudit(c, {
+		action: "price_list_update",
+		entityType: "price_list_item",
+		entityId: id,
+		summary: `Updated price list item ${parsed.name}`,
+		detail: {
+			before: {
+				name: existing.name,
+				unit_cents: existing.unit_cents,
+				product: existing.product,
+			},
+			after: {
+				name: parsed.name,
+				unit_cents: parsed.unitCents,
+				product: parsed.product,
+			},
+		},
+	});
+	return c.redirect(`/settings/price-lists/${id}`);
+});
+
+app.post("/settings/price-lists/:id/active", async (c) => {
+	if (!canManagePriceLists(c.get("user")!)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const existing = await getPriceItem(c.env.DB, id);
+	if (!existing) return c.notFound();
+	const form = await c.req.parseBody();
+	const nextActive = String(form.active || "") === "1" ? 1 : 0;
+	await c.env.DB.prepare(
+		`UPDATE price_list_items SET active = ?, updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(nextActive, id)
+		.run();
+	await recordAudit(c, {
+		action: nextActive ? "price_list_reactivate" : "price_list_deactivate",
+		entityType: "price_list_item",
+		entityId: id,
+		summary: `${nextActive ? "Reactivated" : "Deactivated"} price list item ${existing.name}`,
+	});
+	return c.redirect(`/settings/price-lists/${id}`);
 });
 
 app.get("/", async (c) => {
@@ -4034,7 +4310,7 @@ app.post("/jobs/:id/logs/:logId/void", async (c) => {
 app.get("/jobs/:id/estimate", async (c) => {
 	const id = c.req.param("id");
 	const job = await c.env.DB.prepare(
-		`SELECT j.id, j.title, j.estimate_cents, j.claim_number, j.carrier, j.date_of_loss,
+		`SELECT j.id, j.title, j.job_type, j.estimate_cents, j.claim_number, j.carrier, j.date_of_loss,
       c.name AS customer_name
      FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = ?`,
 	)
@@ -4042,6 +4318,7 @@ app.get("/jobs/:id/estimate", async (c) => {
 		.first<{
 			id: string;
 			title: string;
+			job_type: string;
 			estimate_cents: number | null;
 			claim_number: string | null;
 			carrier: string | null;
@@ -4080,6 +4357,17 @@ app.get("/jobs/:id/estimate", async (c) => {
 			unit: string;
 			unit_cents: number;
 		}>();
+
+	const product = productForJobType(job.job_type);
+	const priceItems =
+		product === "restoration" || product === "floors"
+			? await listActivePriceItemsForProduct(c.env.DB, product)
+			: [];
+	const fromPriceId = String(c.req.query("from_price") || "").trim();
+	const prefillItem =
+		fromPriceId && priceItems.find((p) => p.id === fromPriceId)
+			? priceItems.find((p) => p.id === fromPriceId)!
+			: null;
 
 	const roomRows =
 		rooms.results
@@ -4128,6 +4416,31 @@ app.get("/jobs/:id/estimate", async (c) => {
 			)
 			.join("") || "";
 
+	const priceOptions =
+		priceItems
+			.map(
+				(p) =>
+					`<option value="${escapeHtml(p.id)}"${prefillItem?.id === p.id ? " selected" : ""}>${escapeHtml(p.name)} · ${escapeHtml(money(p.unit_cents))}/${escapeHtml(p.unit)}</option>`,
+			)
+			.join("") || "";
+
+	const pricePicker =
+		priceOptions
+			? `<form method="get" action="/jobs/${escapeHtml(id)}/estimate" class="panel toolbar" style="align-items:end;margin-top:0.75rem">
+      <div class="grow">
+        <label for="from_price">From price list (${escapeHtml(priceListProductLabel(product))})</label>
+        <select id="from_price" name="from_price">
+          <option value="">Select a rate…</option>
+          ${priceOptions}
+        </select>
+      </div>
+      <button class="btn secondary" type="submit">Use rate</button>
+      ${canManagePriceLists(c.get("user")!) ? `<a class="btn secondary" href="/settings/price-lists">Manage lists</a>` : ""}
+    </form>
+    <p class="muted" style="font-size:0.85rem">Use rate prefills the add-line form below — you can still edit before saving.</p>`
+			: `<p class="muted" style="margin-top:0.75rem">No active ${escapeHtml(priceListProductLabel(product))} rates yet.
+      ${canManagePriceLists(c.get("user")!) ? `<a href="/settings/price-lists">Add price list items</a>` : "Ask an Owner to add rates."}</p>`;
+
 	const body = `
     <div class="toolbar">
       <div class="grow">
@@ -4173,6 +4486,7 @@ app.get("/jobs/:id/estimate", async (c) => {
       <thead><tr><th>Room</th><th>Description</th><th>Qty</th><th>Unit $</th><th>Total</th><th></th></tr></thead>
       <tbody>${lineRows}</tbody>
     </table>
+    ${pricePicker}
     <form method="post" action="/jobs/${escapeHtml(id)}/estimate/lines" class="panel stack" style="margin-top:0.75rem">
       <div class="row">
         <div>
@@ -4182,12 +4496,17 @@ app.get("/jobs/:id/estimate", async (c) => {
             ${roomOptions}
           </select>
         </div>
-        <div><label for="description">Description</label><input id="description" name="description" required placeholder="Water extraction" /></div>
+        <div><label for="description">Description</label>
+          <input id="description" name="description" required placeholder="Water extraction"
+            value="${escapeHtml(prefillItem?.name)}" /></div>
       </div>
       <div class="row">
         <div><label for="quantity">Quantity</label><input id="quantity" name="quantity" type="number" step="0.01" min="0" value="1" required /></div>
-        <div><label for="unit">Unit</label><input id="unit" name="unit" value="ea" required /></div>
-        <div><label for="unit_dollars">Unit price ($)</label><input id="unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" value="0" required /></div>
+        <div><label for="unit">Unit</label>
+          <input id="unit" name="unit" value="${escapeHtml(prefillItem?.unit || "ea")}" required /></div>
+        <div><label for="unit_dollars">Unit price ($)</label>
+          <input id="unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" required
+            value="${escapeHtml(prefillItem ? centsToDollarsInput(prefillItem.unit_cents) : "0")}" /></div>
       </div>
       <button class="btn" type="submit">Add line</button>
     </form>`;

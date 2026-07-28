@@ -7,6 +7,7 @@ import {
 } from "./access";
 import { canAccessTrash } from "./soft-delete";
 import { canViewAudit } from "./audit";
+import { canManagePriceLists } from "./price-list";
 
 export function escapeHtml(value: string | number | null | undefined): string {
 	return String(value ?? "")
@@ -52,6 +53,9 @@ export function layout(opts: {
 		if (canAccessTrash(u)) {
 			items.push({ href: "/trash", label: "Trash" });
 			items.push({ href: "/audit", label: "Audit" });
+		}
+		if (canManagePriceLists(u)) {
+			items.push({ href: "/settings/price-lists", label: "Price lists" });
 		}
 		items.push({ href: "/inventory", label: "Inventory" });
 		if (canSeeOfficeTools(u)) {
