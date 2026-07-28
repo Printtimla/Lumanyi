@@ -28,11 +28,13 @@ import {
 	PRINT_STATUSES,
 	printProductLabel,
 	printStatusLabel,
+	printTypesForSelect,
 	syncPrintQuoteTotal,
 } from "./lib/print";
 import { consumeLoginOtp } from "./lib/otp";
 import {
 	FLOOR_TYPES,
+	FLOOR_TYPE_VALUES,
 	PRODUCTS,
 	RESTORATION_TYPES,
 	isValidFieldJobType,
@@ -450,6 +452,7 @@ app.get("/", async (c) => {
 		(p) => `<a class="product-card" href="${escapeHtml(p.href)}">
       <h2>${escapeHtml(p.title)}</h2>
       <p class="muted">${escapeHtml(p.blurb)}</p>
+      ${p.siteHint ? `<p class="muted" style="font-size:0.85rem">${escapeHtml(p.siteHint)}</p>` : ""}
       <span class="btn">Open</span>
     </a>`,
 	).join("");
@@ -692,8 +695,10 @@ app.get("/jobs", async (c) => {
 		);
 		binds.push(...RESTORATION_SQL_TYPES);
 	} else if (product === "floors") {
-		where.push("j.job_type = ?");
-		binds.push("hard_floor");
+		where.push(
+			`j.job_type IN (${FLOOR_TYPE_VALUES.map(() => "?").join(",")})`,
+		);
+		binds.push(...FLOOR_TYPE_VALUES);
 	}
 	if (status) {
 		where.push("j.status = ?");
@@ -816,7 +821,7 @@ app.get("/jobs", async (c) => {
 		product === "restoration"
 			? "Water restoration, structural drying, microbial remediation, bio-hazard, odor removal."
 			: product === "floors"
-				? "Commercial hard-floor jobs and crew schedules."
+				? "Commercial hard-floor jobs — strip & wax, scrub & recoat, burnishing, sealing, epoxy, surfaces."
 				: "All restoration and floor jobs. Use product nav to narrow.";
 
 	const body = `
@@ -871,8 +876,10 @@ app.get("/jobs/export.csv", async (c) => {
 		);
 		binds.push(...RESTORATION_SQL_TYPES);
 	} else if (product === "floors") {
-		where.push("j.job_type = ?");
-		binds.push("hard_floor");
+		where.push(
+			`j.job_type IN (${FLOOR_TYPE_VALUES.map(() => "?").join(",")})`,
+		);
+		binds.push(...FLOOR_TYPE_VALUES);
 	}
 	if (status) {
 		where.push("j.status = ?");
@@ -1919,14 +1926,17 @@ app.get("/recurring", async (c) => {
         <div>
           <label for="job_type">Service type</label>
           <select id="job_type" name="job_type">
-            ${FLOOR_TYPES.map(
-							(t) =>
-								`<option value="${escapeHtml(t.value)}" selected>${escapeHtml(t.label)}</option>`,
-						).join("")}
+            ${FLOOR_TYPES.filter((t) => t.value !== "hard_floor")
+							.map(
+								(t, i) =>
+									`<option value="${escapeHtml(t.value)}" ${i === 0 ? "selected" : ""}>${escapeHtml(t.label)}</option>`,
+							)
+							.join("")}
             ${RESTORATION_TYPES.map(
 							(t) =>
 								`<option value="${escapeHtml(t.value)}">${escapeHtml(t.label)}</option>`,
 						).join("")}
+            <option value="hard_floor">Hard floor (general)</option>
           </select>
         </div>
         <div>
@@ -2174,7 +2184,7 @@ app.get("/print/new", async (c) => {
 					`<option value="${escapeHtml(u.id)}">${escapeHtml(u.name)}</option>`,
 			)
 			.join("") || "";
-	const productOptions = PRINT_PRODUCT_TYPES.map(
+	const productOptions = printTypesForSelect().map(
 		(p) =>
 			`<option value="${p.value}">${escapeHtml(p.label)}</option>`,
 	).join("");
@@ -2316,7 +2326,7 @@ app.get("/print/:id", async (c) => {
 		(s) =>
 			`<option value="${s.value}" ${job.status === s.value ? "selected" : ""}>${escapeHtml(s.label)}</option>`,
 	).join("");
-	const productOptions = PRINT_PRODUCT_TYPES.map(
+	const productOptions = printTypesForSelect(job.product_type).map(
 		(p) =>
 			`<option value="${p.value}" ${job.product_type === p.value ? "selected" : ""}>${escapeHtml(p.label)}</option>`,
 	).join("");

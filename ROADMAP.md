@@ -44,6 +44,9 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] Home hero with three product cards
 - [x] Nav: Restoration | Floors | Print (+ shared Customers / Calendar / Users / Tech)
 - [x] Product-scoped job lists (`/restoration`, `/floors`) + service-type dropdown
+- [x] Import floor process types from timlafloorrestoration.com
+- [x] Import print catalog types from sacramentob2bprint.com (`services.yml`)
+- [x] Biohazard spelling: Biohazard / Trauma & crime scene cleaning
 
 ## Later — Estimating track
 

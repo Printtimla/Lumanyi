@@ -8,6 +8,12 @@ const WATER_BASE = [
 	"Customer walkthrough / sign-off",
 ];
 
+const FLOOR_BASE = [
+	"Confirm floor type and sq ft",
+	"Move furniture / protect edges",
+	"Customer walkthrough / sign-off",
+];
+
 export const CHECKLISTS: Record<FieldJobType, string[]> = {
 	restoration: [
 		...WATER_BASE,
@@ -46,12 +52,72 @@ export const CHECKLISTS: Record<FieldJobType, string[]> = {
 		"Treatment applied",
 		"Re-check odor / customer walkthrough",
 	],
+	strip_wax: [
+		...FLOOR_BASE,
+		"Full strip of old finish complete",
+		"Multi-coat refinish applied / dry",
+	],
+	floor_waxing: [
+		...FLOOR_BASE,
+		"Finish coats applied",
+		"Dry / gloss check complete",
+	],
+	scrub_recoat: [
+		...FLOOR_BASE,
+		"Scrub / interim pass complete",
+		"Recoat applied / dry",
+	],
+	burnishing: [
+		...FLOOR_BASE,
+		"Burnish / buff pass complete",
+		"Wet-look gloss verified",
+	],
+	floor_sealing: [
+		...FLOOR_BASE,
+		"Sealer matched to substrate",
+		"Sealer applied / cure checked",
+	],
+	epoxy: [
+		...FLOOR_BASE,
+		"Surface prep complete",
+		"Epoxy system applied",
+		"Cure time / traffic release confirmed",
+	],
+	tile_grout: [
+		...FLOOR_BASE,
+		"Tile & grout clean / restore complete",
+		"Grout sealed if in scope",
+	],
+	concrete: [
+		...FLOOR_BASE,
+		"Soil / marks removed",
+		"Seal or epoxy prep complete if in scope",
+	],
+	hardwood: [
+		...FLOOR_BASE,
+		"Wood-safe chemistry used",
+		"Finish / wax step complete if in scope",
+	],
+	laminate: [
+		...FLOOR_BASE,
+		"Moisture-safe clean complete",
+		"Edges checked for swell risk",
+	],
+	vinyl_linoleum: [
+		...FLOOR_BASE,
+		"Clean / scrub pass complete",
+		"Finish / recoat if in scope",
+	],
+	pet_odor_removal: [
+		"Affected area / sq ft documented",
+		"Enzyme / treatment applied",
+		"Subfloor seal if in scope",
+		"Odor re-check / customer walkthrough",
+	],
 	hard_floor: [
-		"Confirm floor type and sq ft",
-		"Move furniture / protect edges",
+		...FLOOR_BASE,
 		"Clean / scrub pass complete",
 		"Dry / finish pass complete",
-		"Customer walkthrough / sign-off",
 	],
 };
 
