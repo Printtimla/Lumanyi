@@ -34,6 +34,10 @@ export type WaterLossPdfInput = {
 		user_name: string | null;
 		body: string;
 	}>;
+	moistureMaps?: Array<{
+		filename: string;
+		label: string | null;
+	}>;
 };
 
 function fmtNum(n: number | null | undefined, suffix = ""): string {
@@ -101,6 +105,19 @@ export async function buildWaterLossPdf(
 				.join(", ");
 			const row = `${date} | ${m.area || "-"} | ${m.reading || "-"} | ${psycho || "no ambient"} | ${m.notes || ""}`;
 			draw(row, 9);
+		}
+	}
+	y -= 8;
+
+	const maps = input.moistureMaps || [];
+	draw("Moisture maps / floor plans", 12, true);
+	if (!maps.length) {
+		draw("No moisture map images attached. (See job page for uploads.)", 10);
+	} else {
+		draw(`${maps.length} image(s) on file in Lumanyi (view on job page):`, 10);
+		for (const m of maps) {
+			const label = m.label ? `${m.label} - ` : "";
+			draw(`- ${label}${m.filename}`, 9);
 		}
 	}
 	y -= 8;

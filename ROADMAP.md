@@ -79,6 +79,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] Drying pack / water-loss PDF (psychrometric fields + S500-style docs)
 - [x] Ops dashboard (home snapshot)
 - [x] Auto GPP from temp + RH on moisture logs
+- [x] Moisture map image uploads (2D)
 
 ## Phase 6 — Multi-brand
 

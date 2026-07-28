@@ -2158,6 +2158,39 @@ app.get("/jobs/:id", async (c) => {
 				.join("") ||
 			`<tr><td colspan="7" class="muted">No moisture readings yet.</td></tr>`;
 
+		const moistureMaps = await c.env.DB.prepare(
+			`SELECT id, filename, content_type, label, created_at FROM job_moisture_maps
+       WHERE job_id = ? ORDER BY created_at DESC`,
+		)
+			.bind(id)
+			.all<{
+				id: string;
+				filename: string;
+				content_type: string | null;
+				label: string | null;
+				created_at: string;
+			}>();
+
+		const moistureMapItems =
+			moistureMaps.results
+				?.map(
+					(m) => `<div class="panel" style="padding:0.75rem">
+        <a href="/jobs/${escapeHtml(id)}/moisture-maps/${escapeHtml(m.id)}" target="_blank" rel="noopener">
+          <img src="/jobs/${escapeHtml(id)}/moisture-maps/${escapeHtml(m.id)}" alt="${escapeHtml(m.label || m.filename)}"
+            style="max-width:100%;max-height:280px;border-radius:8px;display:block;margin-bottom:0.5rem" />
+        </a>
+        <div class="muted" style="font-size:0.8rem">
+          ${m.label ? `${escapeHtml(m.label)} · ` : ""}${escapeHtml(m.filename)}
+          · ${escapeHtml(m.created_at.slice(0, 16).replace("T", " "))}
+        </div>
+        <form method="post" action="/jobs/${escapeHtml(id)}/moisture-maps/${escapeHtml(m.id)}/delete" class="inline"
+          onsubmit="return confirm('Delete this moisture map?');">
+          <button class="linkish" type="submit">Delete</button>
+        </form>
+      </div>`,
+				)
+				.join("") || `<p class="muted">No moisture maps yet.</p>`;
+
 		const equipmentRows =
 			logs.results
 				?.filter((l) => l.kind === "equipment")
@@ -2210,6 +2243,19 @@ app.get("/jobs/:id", async (c) => {
       <thead><tr><th>Date</th><th>Area</th><th>Reading</th><th>Ambient</th><th>Notes</th><th>By</th><th></th></tr></thead>
       <tbody>${moistureRows}</tbody>
     </table>
+
+    <h2>Moisture maps</h2>
+    <p class="muted">Upload floor-plan or moisture-map photos (2D). Listed on the water-loss PDF by filename.</p>
+    <form method="post" action="/jobs/${escapeHtml(id)}/moisture-maps" enctype="multipart/form-data" class="panel stack" style="margin-bottom:1rem">
+      <div class="row">
+        <div class="grow"><label for="map_file">Image (max 10 MB)</label>
+          <input id="map_file" name="map" type="file" accept="image/*" required /></div>
+        <div><label for="map_label">Label</label>
+          <input id="map_label" name="label" placeholder="Day 1 floor plan" /></div>
+      </div>
+      <button class="btn" type="submit">Upload map</button>
+    </form>
+    <div class="stack">${moistureMapItems}</div>
 
     <h2>Equipment log</h2>
     <p class="muted">Air movers, dehumidifiers, and other drying equipment on site.</p>
@@ -3179,6 +3225,12 @@ app.get("/jobs/:id/water-loss.pdf", async (c) => {
 		.bind(id)
 		.all<{ body: string; created_at: string; user_name: string | null }>();
 
+	const moistureMaps = await c.env.DB.prepare(
+		`SELECT filename, label FROM job_moisture_maps WHERE job_id = ? ORDER BY created_at ASC`,
+	)
+		.bind(id)
+		.all<{ filename: string; label: string | null }>();
+
 	const siteLine = job.address_line1
 		? `${job.address_line1}, ${job.city}, ${job.state} ${job.postal_code || ""}`.trim()
 		: "";
@@ -3215,6 +3267,7 @@ app.get("/jobs/:id/water-loss.pdf", async (c) => {
 				notes: l.notes,
 			})),
 		fieldNotes: fieldNotes.results || [],
+		moistureMaps: moistureMaps.results || [],
 	});
 
 	return new Response(bytes, {
@@ -3345,6 +3398,100 @@ app.post("/jobs/:id/photos/:photoId/delete", async (c) => {
 		`DELETE FROM job_photos WHERE id = ? AND job_id = ?`,
 	)
 		.bind(photoId, id)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/moisture-maps", async (c) => {
+	const id = c.req.param("id");
+	const gate = await requireRestorationJob(c.env.DB, id);
+	if (gate instanceof Response) return gate;
+
+	const form = await c.req.parseBody();
+	const file = form.map;
+	if (!file || !(file instanceof File)) {
+		return c.text("Map image required", 400);
+	}
+	if (!file.type.startsWith("image/")) {
+		return c.text("Only image uploads are allowed", 400);
+	}
+	if (file.size > MAX_PHOTO_BYTES) {
+		return c.text("Image must be 10 MB or smaller", 400);
+	}
+
+	const mapId = newId("mmap");
+	const safeName =
+		file.name.replace(/[^\w.\-]+/g, "_").slice(0, 120) || "moisture-map.jpg";
+	const r2Key = `jobs/${id}/moisture-maps/${mapId}/${safeName}`;
+	const bytes = new Uint8Array(await file.arrayBuffer());
+	await c.env.UPLOADS.put(r2Key, bytes, {
+		httpMetadata: { contentType: file.type },
+		customMetadata: { jobId: id, mapId, filename: safeName },
+	});
+	await c.env.DB.prepare(
+		`INSERT INTO job_moisture_maps (id, job_id, r2_key, filename, content_type, size_bytes, label, uploaded_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			mapId,
+			id,
+			r2Key,
+			safeName,
+			file.type || null,
+			file.size,
+			String(form.label || "").trim() || null,
+			c.get("user")!.id,
+		)
+		.run();
+	await c.env.DB.prepare(
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.get("/jobs/:id/moisture-maps/:mapId", async (c) => {
+	const id = c.req.param("id");
+	const mapId = c.req.param("mapId");
+	const row = await c.env.DB.prepare(
+		`SELECT r2_key, content_type, filename FROM job_moisture_maps WHERE id = ? AND job_id = ?`,
+	)
+		.bind(mapId, id)
+		.first<{ r2_key: string; content_type: string | null; filename: string }>();
+	if (!row) return c.notFound();
+	const obj = await c.env.UPLOADS.get(row.r2_key);
+	if (!obj) return c.notFound();
+	const headers = new Headers();
+	headers.set(
+		"Content-Type",
+		row.content_type || obj.httpMetadata?.contentType || "application/octet-stream",
+	);
+	headers.set("Cache-Control", "private, max-age=3600");
+	headers.set(
+		"Content-Disposition",
+		`inline; filename="${row.filename.replace(/"/g, "")}"`,
+	);
+	return new Response(obj.body, { headers });
+});
+
+app.post("/jobs/:id/moisture-maps/:mapId/delete", async (c) => {
+	const id = c.req.param("id");
+	const mapId = c.req.param("mapId");
+	const gate = await requireRestorationJob(c.env.DB, id);
+	if (gate instanceof Response) return gate;
+
+	const row = await c.env.DB.prepare(
+		`SELECT r2_key FROM job_moisture_maps WHERE id = ? AND job_id = ?`,
+	)
+		.bind(mapId, id)
+		.first<{ r2_key: string }>();
+	if (!row) return c.notFound();
+	await c.env.UPLOADS.delete(row.r2_key);
+	await c.env.DB.prepare(
+		`DELETE FROM job_moisture_maps WHERE id = ? AND job_id = ?`,
+	)
+		.bind(mapId, id)
 		.run();
 	return c.redirect(`/jobs/${id}`);
 });
