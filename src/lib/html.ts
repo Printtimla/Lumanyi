@@ -28,6 +28,7 @@ export function layout(opts: {
 				{ href: "/floors", label: "Floors" },
 				{ href: "/print", label: "Print" },
 				{ href: "/customers", label: "Customers" },
+				{ href: "/leads", label: "Leads" },
 				{ href: "/calendar", label: "Calendar" },
 			]
 		: [];

@@ -72,6 +72,11 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] Reporting / CSV depth
 - [x] Client portal (optional)
 
+## A-tier — Restoration depth
+
+- [x] Lead pipeline (`/leads`, source + follow-up)
+- [ ] Job cost tracking (labor / materials / equipment days)
+
 ## Phase 6 — Multi-brand
 
 - [ ] Separate domains / branding per product — **deferred**

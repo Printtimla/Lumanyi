@@ -74,6 +74,13 @@ import {
 	setPortalCookie,
 	type PortalCustomer,
 } from "./lib/portal";
+import {
+	LEAD_SOURCES,
+	followUpDateValue,
+	isFollowUpOverdue,
+	leadSourceLabel,
+	normalizeLeadSource,
+} from "./lib/leads";
 
 const RESTORATION_SQL_TYPES = [
 	...RESTORATION_TYPES.map((t) => t.value),
@@ -1085,6 +1092,237 @@ app.post("/customers/:id/portal/:tokenId/revoke", async (c) => {
 	return c.redirect(`/customers/${id}`);
 });
 
+app.get("/leads", async (c) => {
+	const product = c.req.query("product") || "";
+	const tech = c.req.query("tech") || "";
+	const stage = c.req.query("stage") || ""; // lead | estimate | ""
+
+	const where: string[] = ["j.status IN ('lead', 'estimate')"];
+	const binds: string[] = [];
+
+	if (product === "restoration") {
+		where.push(
+			`j.job_type IN (${RESTORATION_SQL_TYPES.map(() => "?").join(",")})`,
+		);
+		binds.push(...RESTORATION_SQL_TYPES);
+	} else if (product === "floors") {
+		where.push(
+			`j.job_type IN (${FLOOR_TYPE_VALUES.map(() => "?").join(",")})`,
+		);
+		binds.push(...FLOOR_TYPE_VALUES);
+	}
+	if (tech) {
+		where.push("j.assigned_user_id = ?");
+		binds.push(tech);
+	}
+	if (stage === "lead" || stage === "estimate") {
+		where.push("j.status = ?");
+		binds.push(stage);
+	}
+
+	const sql = `SELECT j.id, j.title, j.job_type, j.status, j.lead_source, j.follow_up_at,
+      j.estimate_cents, j.created_at, j.updated_at,
+      c.name AS customer_name, u.name AS assignee_name
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN users u ON u.id = j.assigned_user_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY
+       CASE WHEN j.follow_up_at IS NULL THEN 1 ELSE 0 END,
+       j.follow_up_at ASC,
+       j.updated_at DESC
+     LIMIT 200`;
+
+	const stmt = c.env.DB.prepare(sql);
+	const leads = binds.length
+		? await stmt.bind(...binds).all<{
+				id: string;
+				title: string;
+				job_type: string;
+				status: string;
+				lead_source: string | null;
+				follow_up_at: string | null;
+				estimate_cents: number | null;
+				created_at: string;
+				updated_at: string;
+				customer_name: string;
+				assignee_name: string | null;
+			}>()
+		: await stmt.all<{
+				id: string;
+				title: string;
+				job_type: string;
+				status: string;
+				lead_source: string | null;
+				follow_up_at: string | null;
+				estimate_cents: number | null;
+				created_at: string;
+				updated_at: string;
+				customer_name: string;
+				assignee_name: string | null;
+			}>();
+
+	const staff = await c.env.DB.prepare(
+		`SELECT id, name, COALESCE(designation, role) AS role FROM users ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string; role: string }>();
+
+	const today = new Date().toISOString().slice(0, 10);
+
+	const card = (j: {
+		id: string;
+		title: string;
+		job_type: string;
+		status: string;
+		lead_source: string | null;
+		follow_up_at: string | null;
+		estimate_cents: number | null;
+		customer_name: string;
+		assignee_name: string | null;
+	}) => {
+		const overdue = isFollowUpOverdue(j.follow_up_at, today);
+		const followLabel = j.follow_up_at
+			? j.follow_up_at.slice(0, 10)
+			: "Not set";
+		return `<div class="panel stack" style="padding:0.9rem">
+      <div>
+        <a href="/jobs/${escapeHtml(j.id)}"><strong>${escapeHtml(j.title)}</strong></a>
+        <div class="muted" style="font-size:0.85rem;margin-top:0.25rem">
+          ${escapeHtml(j.customer_name)} · ${escapeHtml(jobTypeLabel(j.job_type))}
+        </div>
+      </div>
+      <div class="muted" style="font-size:0.85rem">
+        Source: ${escapeHtml(leadSourceLabel(j.lead_source))}<br>
+        Assigned: ${escapeHtml(j.assignee_name) || "Unassigned"}<br>
+        Estimate: ${escapeHtml(money(j.estimate_cents))}<br>
+        Follow-up: <span${overdue ? ' style="color:#991b1b;font-weight:600"' : ""}>${escapeHtml(followLabel)}${overdue ? " · overdue" : ""}</span>
+      </div>
+      <form method="post" action="/leads/${escapeHtml(j.id)}/follow-up" class="toolbar" style="align-items:end;gap:0.5rem">
+        <div class="grow">
+          <label for="fu_${escapeHtml(j.id)}">Follow-up</label>
+          <input id="fu_${escapeHtml(j.id)}" name="follow_up_at" type="date"
+            value="${escapeHtml(followUpDateValue(j.follow_up_at))}" />
+        </div>
+        <button class="btn secondary" type="submit">Save</button>
+      </form>
+      <div class="toolbar" style="gap:0.5rem">
+        <a class="btn secondary" href="/jobs/${escapeHtml(j.id)}">Open</a>
+        <form method="post" action="/leads/${escapeHtml(j.id)}/schedule" class="inline">
+          <button class="btn" type="submit">Mark scheduled</button>
+        </form>
+      </div>
+    </div>`;
+	};
+
+	const leadCards =
+		leads.results
+			?.filter((j) => j.status === "lead")
+			.map(card)
+			.join("") || `<p class="muted">No leads in this stage.</p>`;
+	const estimateCards =
+		leads.results
+			?.filter((j) => j.status === "estimate")
+			.map(card)
+			.join("") || `<p class="muted">No estimates in this stage.</p>`;
+
+	const techOptions =
+		staff.results
+			?.map(
+				(u) =>
+					`<option value="${escapeHtml(u.id)}" ${tech === u.id ? "selected" : ""}>${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
+			)
+			.join("") || "";
+
+	const body = `
+    <div class="toolbar">
+      <div class="grow">
+        <h1 style="margin:0">Lead pipeline</h1>
+        <p class="muted" style="margin:0.35rem 0 0">Jobs in lead or estimate — set source and follow-up, then schedule.</p>
+      </div>
+      <a class="btn" href="/jobs/new">New job</a>
+    </div>
+
+    <form class="panel toolbar" method="get" action="/leads" style="align-items:end;margin-top:1rem">
+      <div>
+        <label for="product">Product</label>
+        <select id="product" name="product">
+          <option value="" ${!product ? "selected" : ""}>All field</option>
+          <option value="restoration" ${product === "restoration" ? "selected" : ""}>Restoration</option>
+          <option value="floors" ${product === "floors" ? "selected" : ""}>Floors</option>
+        </select>
+      </div>
+      <div>
+        <label for="tech">Assignee</label>
+        <select id="tech" name="tech">
+          <option value="">Anyone</option>
+          ${techOptions}
+        </select>
+      </div>
+      <div>
+        <label for="stage">Stage</label>
+        <select id="stage" name="stage">
+          <option value="" ${!stage ? "selected" : ""}>Lead + estimate</option>
+          <option value="lead" ${stage === "lead" ? "selected" : ""}>Lead only</option>
+          <option value="estimate" ${stage === "estimate" ? "selected" : ""}>Estimate only</option>
+        </select>
+      </div>
+      <button class="btn" type="submit">Filter</button>
+      <a class="btn secondary" href="/leads">Clear</a>
+    </form>
+
+    <div class="row" style="margin-top:1.25rem;align-items:start">
+      <div class="stack grow">
+        <h2 style="margin:0">Lead <span class="muted">(${leads.results?.filter((j) => j.status === "lead").length ?? 0})</span></h2>
+        ${stage === "estimate" ? `<p class="muted">Hidden by stage filter.</p>` : leadCards}
+      </div>
+      <div class="stack grow">
+        <h2 style="margin:0">Estimate <span class="muted">(${leads.results?.filter((j) => j.status === "estimate").length ?? 0})</span></h2>
+        ${stage === "lead" ? `<p class="muted">Hidden by stage filter.</p>` : estimateCards}
+      </div>
+    </div>`;
+
+	return c.html(page(c, "Leads", body));
+});
+
+app.post("/leads/:id/follow-up", async (c) => {
+	const id = c.req.param("id");
+	const form = await c.req.parseBody();
+	const followUp = String(form.follow_up_at || "").trim() || null;
+	const job = await c.env.DB.prepare(
+		`SELECT id, status FROM jobs WHERE id = ?`,
+	)
+		.bind(id)
+		.first<{ id: string; status: string }>();
+	if (!job) return c.notFound();
+	if (job.status !== "lead" && job.status !== "estimate") {
+		return c.redirect(`/jobs/${id}`);
+	}
+	await c.env.DB.prepare(
+		`UPDATE jobs SET follow_up_at = ?, updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(followUp, id)
+		.run();
+	return c.redirect("/leads");
+});
+
+app.post("/leads/:id/schedule", async (c) => {
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT id, status FROM jobs WHERE id = ?`,
+	)
+		.bind(id)
+		.first<{ id: string; status: string }>();
+	if (!job) return c.notFound();
+	if (job.status !== "lead" && job.status !== "estimate") {
+		return c.redirect(`/jobs/${id}`);
+	}
+	await c.env.DB.prepare(
+		`UPDATE jobs SET status = 'scheduled', updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
 app.get("/jobs", async (c) => {
 	const status = c.req.query("status") || "";
 	const tech = c.req.query("tech") || "";
@@ -1621,6 +1859,8 @@ app.get("/jobs/:id", async (c) => {
 			claim_number: string | null;
 			carrier: string | null;
 			date_of_loss: string | null;
+			lead_source: string | null;
+			follow_up_at: string | null;
 			customer_id: string;
 			customer_name: string;
 			assigned_user_id: string | null;
@@ -1909,6 +2149,14 @@ app.get("/jobs/:id", async (c) => {
 			)
 			.join("") || "";
 
+	const leadSourceOptions = [
+		`<option value="">—</option>`,
+		...LEAD_SOURCES.map(
+			(s) =>
+				`<option value="${escapeHtml(s.value)}" ${job.lead_source === s.value ? "selected" : ""}>${escapeHtml(s.label)}</option>`,
+		),
+	].join("");
+
 	const body = `
     <div class="toolbar">
       <div class="grow">
@@ -1947,6 +2195,13 @@ app.get("/jobs/:id", async (c) => {
         <div><span class="muted">Claim #</span><br>${escapeHtml(job.claim_number) || "—"}</div>
         <div><span class="muted">Carrier</span><br>${escapeHtml(job.carrier) || "—"}</div>
         <div><span class="muted">Date of loss</span><br>${escapeHtml(job.date_of_loss) || "—"}</div>
+        <div><span class="muted">Lead source</span><br>${escapeHtml(leadSourceLabel(job.lead_source))}</div>
+        <div><span class="muted">Follow-up</span><br>${
+					job.follow_up_at
+						? escapeHtml(job.follow_up_at.slice(0, 10)) +
+							(isFollowUpOverdue(job.follow_up_at) ? " · overdue" : "")
+						: "—"
+				} · <a href="/leads">pipeline</a></div>
         ${job.notes ? `<div><span class="muted">Job notes</span><br>${escapeHtml(job.notes)}</div>` : ""}
       </div>
 
@@ -1979,6 +2234,14 @@ app.get("/jobs/:id", async (c) => {
             <div><label for="invoice_dollars">Invoice ($)</label>
               <input id="invoice_dollars" name="invoice_dollars" type="number" step="0.01" min="0"
                 value="${job.invoice_cents != null ? (job.invoice_cents / 100).toFixed(2) : ""}" /></div>
+          </div>
+          <h2 style="margin:0.5rem 0 0">Lead</h2>
+          <div class="row">
+            <div><label for="lead_source">Source</label>
+              <select id="lead_source" name="lead_source">${leadSourceOptions}</select></div>
+            <div><label for="follow_up_at">Follow-up</label>
+              <input id="follow_up_at" name="follow_up_at" type="date"
+                value="${escapeHtml(followUpDateValue(job.follow_up_at))}" /></div>
           </div>
           <h2 style="margin:0.5rem 0 0">Claim</h2>
           <div class="row">
@@ -2035,6 +2298,8 @@ app.post("/jobs/:id", async (c) => {
       claim_number = ?,
       carrier = ?,
       date_of_loss = ?,
+      lead_source = ?,
+      follow_up_at = ?,
       updated_at = datetime('now')
      WHERE id = ?`,
 	)
@@ -2048,6 +2313,8 @@ app.post("/jobs/:id", async (c) => {
 			String(form.claim_number || "").trim() || null,
 			String(form.carrier || "").trim() || null,
 			String(form.date_of_loss || "").trim() || null,
+			normalizeLeadSource(String(form.lead_source || "")),
+			String(form.follow_up_at || "").trim() || null,
 			id,
 		)
 		.run();
