@@ -127,6 +127,13 @@ import {
 	canSoftDelete,
 } from "./lib/soft-delete";
 import {
+	canHardDelete,
+	hardDeleteCustomer,
+	hardDeleteFieldJob,
+	hardDeletePrintJob,
+	verifyOwnerPasswordForHardDelete,
+} from "./lib/hard-delete";
+import {
 	canSetAssetStatusWithOpenAssignment,
 	canVoidClaimData,
 	normalizeVoidReason,
@@ -194,6 +201,36 @@ function voidActionForm(action: string, buttonLabel = "Void"): string {
       style="max-width:14rem;font-size:0.85rem" />
     <button class="linkish" type="submit">${escapeHtml(buttonLabel)}</button>
   </form>`;
+}
+
+/** SA-4: Owner break-glass hard delete — password re-entry required. */
+function hardDeleteForm(action: string, confirmMessage: string): string {
+	return `<form method="post" action="${action}" class="stack" style="gap:0.35rem;min-width:11rem"
+    onsubmit="return confirm(${JSON.stringify(confirmMessage)});">
+    <input type="password" name="owner_password" required autocomplete="current-password"
+      placeholder="Your password" style="font-size:0.85rem" />
+    <button type="submit" class="btn secondary" style="border-color:#b91c1c;color:#991b1b">Delete forever</button>
+  </form>`;
+}
+
+async function requireHardDeletePassword(
+	c: Context<{ Bindings: Env; Variables: Variables }>,
+): Promise<Response | null> {
+	const user = c.get("user")!;
+	if (!canHardDelete(user)) return c.text("Forbidden", 403);
+	const form = await c.req.parseBody();
+	const row = await c.env.DB.prepare(
+		`SELECT password_hash FROM users WHERE id = ?`,
+	)
+		.bind(user.id)
+		.first<{ password_hash: string }>();
+	if (
+		!row ||
+		!(await verifyOwnerPasswordForHardDelete(form.owner_password, row.password_hash))
+	) {
+		return c.text("Password incorrect — hard delete cancelled.", 403);
+	}
+	return null;
 }
 
 async function loadFieldJobAccess(
@@ -1310,9 +1347,13 @@ app.get("/trash", async (c) => {
             <button class="btn secondary" type="submit">Restore</button>
           </form>
         </td>
+        <td>${hardDeleteForm(
+					`/trash/customers/${escapeHtml(r.id)}/hard-delete`,
+					"PERMANENTLY delete this customer and ALL their field jobs, print jobs, sites, and portal links? This cannot be undone.",
+				)}</td>
       </tr>`,
 			)
-			.join("") || `<tr><td colspan="3" class="muted">No archived customers.</td></tr>`;
+			.join("") || `<tr><td colspan="4" class="muted">No archived customers.</td></tr>`;
 
 	const jobRows =
 		jobs.results
@@ -1327,9 +1368,13 @@ app.get("/trash", async (c) => {
             <button class="btn secondary" type="submit">Restore</button>
           </form>
         </td>
+        <td>${hardDeleteForm(
+					`/trash/jobs/${escapeHtml(r.id)}/hard-delete`,
+					"PERMANENTLY delete this field job, logs, photos, and maps? This cannot be undone.",
+				)}</td>
       </tr>`,
 			)
-			.join("") || `<tr><td colspan="5" class="muted">No archived field jobs.</td></tr>`;
+			.join("") || `<tr><td colspan="6" class="muted">No archived field jobs.</td></tr>`;
 
 	const printRows =
 		prints.results
@@ -1344,26 +1389,33 @@ app.get("/trash", async (c) => {
             <button class="btn secondary" type="submit">Restore</button>
           </form>
         </td>
+        <td>${hardDeleteForm(
+					`/trash/print/${escapeHtml(r.id)}/hard-delete`,
+					"PERMANENTLY delete this print job and its files? This cannot be undone.",
+				)}</td>
       </tr>`,
 			)
-			.join("") || `<tr><td colspan="5" class="muted">No archived print jobs.</td></tr>`;
+			.join("") || `<tr><td colspan="6" class="muted">No archived print jobs.</td></tr>`;
 
 	const body = `
     <h1>Trash / Archive</h1>
-    <p class="muted">Soft-deleted records. Restore returns them to daily lists. Hard delete is not available here (SA-4 later).</p>
+    <p class="muted">Soft-deleted records. Restore returns them to daily lists.
+      <strong>Delete forever</strong> is Owner-only, requires your password, and cannot be undone.
+      Deleting a customer also wipes every field/print job under that customer (privacy wipe).
+      Immutable audit log for these actions ships in SA-5.</p>
     <h2>Customers</h2>
     <table>
-      <thead><tr><th>Name</th><th>Archived</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Archived</th><th>Restore</th><th>Hard delete</th></tr></thead>
       <tbody>${custRows}</tbody>
     </table>
     <h2>Field jobs</h2>
     <table>
-      <thead><tr><th>Job</th><th>Customer</th><th>Type</th><th>Archived</th><th></th></tr></thead>
+      <thead><tr><th>Job</th><th>Customer</th><th>Type</th><th>Archived</th><th>Restore</th><th>Hard delete</th></tr></thead>
       <tbody>${jobRows}</tbody>
     </table>
     <h2>Print jobs</h2>
     <table>
-      <thead><tr><th>Job</th><th>Customer</th><th>Product</th><th>Archived</th><th></th></tr></thead>
+      <thead><tr><th>Job</th><th>Customer</th><th>Product</th><th>Archived</th><th>Restore</th><th>Hard delete</th></tr></thead>
       <tbody>${printRows}</tbody>
     </table>`;
 
@@ -1403,6 +1455,33 @@ app.post("/trash/print/:id/restore", async (c) => {
 		.bind(id)
 		.run();
 	return c.redirect(`/print/${id}`);
+});
+
+app.post("/trash/customers/:id/hard-delete", async (c) => {
+	const denied = await requireHardDeletePassword(c);
+	if (denied) return denied;
+	const id = c.req.param("id");
+	const result = await hardDeleteCustomer(c.env.DB, c.env.UPLOADS, id);
+	if (!result.ok) return c.text(result.error, result.status);
+	return c.redirect("/trash");
+});
+
+app.post("/trash/jobs/:id/hard-delete", async (c) => {
+	const denied = await requireHardDeletePassword(c);
+	if (denied) return denied;
+	const id = c.req.param("id");
+	const result = await hardDeleteFieldJob(c.env.DB, c.env.UPLOADS, id);
+	if (!result.ok) return c.text(result.error, result.status);
+	return c.redirect("/trash");
+});
+
+app.post("/trash/print/:id/hard-delete", async (c) => {
+	const denied = await requireHardDeletePassword(c);
+	if (denied) return denied;
+	const id = c.req.param("id");
+	const result = await hardDeletePrintJob(c.env.DB, c.env.UPLOADS, id);
+	if (!result.ok) return c.text(result.error, result.status);
+	return c.redirect("/trash");
 });
 
 app.get("/", async (c) => {
