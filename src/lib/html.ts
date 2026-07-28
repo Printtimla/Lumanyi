@@ -36,6 +36,7 @@ export function layout(opts: {
 	}
 	if (opts.user) {
 		items.push({ href: "/inventory", label: "Inventory" });
+		items.push({ href: "/reports", label: "Reports" });
 		items.push({ href: "/recurring", label: "Recurring" });
 		items.push({ href: "/print/board", label: "Press board" });
 		items.push({ href: "/tech", label: "Tech" });

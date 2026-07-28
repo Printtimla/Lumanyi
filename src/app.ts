@@ -54,6 +54,7 @@ import {
 	equipmentTypeLabel,
 	type FieldLogRow,
 } from "./lib/field-logs";
+import { csvResponse } from "./lib/csv";
 import {
 	ASSET_STATUSES,
 	assetStatusLabel,
@@ -2523,6 +2524,327 @@ app.post("/inventory/:id", async (c) => {
 		)
 		.run();
 	return c.redirect(`/inventory/${id}`);
+});
+
+app.get("/reports", async (c) => {
+	const from = c.req.query("from") || "";
+	const to = c.req.query("to") || "";
+	const q = new URLSearchParams();
+	if (from) q.set("from", from);
+	if (to) q.set("to", to);
+	const qs = q.toString() ? `?${q}` : "";
+
+	const body = `
+    <h1>Reports</h1>
+    <p class="muted">Date-range CSV exports for ops. Leave dates blank for all rows (capped).</p>
+    <form class="panel toolbar" method="get" action="/reports" style="align-items:end">
+      <div>
+        <label for="from">From</label>
+        <input id="from" name="from" type="date" value="${escapeHtml(from)}" />
+      </div>
+      <div>
+        <label for="to">To</label>
+        <input id="to" name="to" type="date" value="${escapeHtml(to)}" />
+      </div>
+      <button class="btn secondary" type="submit">Apply dates</button>
+      <a class="btn secondary" href="/reports">Clear</a>
+    </form>
+    <div class="stack" style="margin-top:1rem">
+      <div class="panel stack">
+        <strong>Field jobs (rich)</strong>
+        <p class="muted" style="margin:0">Customer, site, type, status, assignee, schedule, claim, estimate/invoice.</p>
+        <div><a class="btn" href="/reports/jobs.csv${qs}">Download jobs CSV</a></div>
+      </div>
+      <div class="panel stack">
+        <strong>Moisture &amp; equipment logs</strong>
+        <p class="muted" style="margin:0">Field log entries by job (logged date filter).</p>
+        <div><a class="btn" href="/reports/field-logs.csv${qs}">Download field logs CSV</a></div>
+      </div>
+      <div class="panel stack">
+        <strong>Inventory assignments</strong>
+        <p class="muted" style="margin:0">Unit check-out / return history (assigned date filter).</p>
+        <div><a class="btn" href="/reports/inventory.csv${qs}">Download inventory CSV</a></div>
+      </div>
+      <div class="panel stack">
+        <strong>Print jobs</strong>
+        <p class="muted" style="margin:0">Print pipeline with product type, status, due, estimate (updated date filter).</p>
+        <div><a class="btn" href="/reports/print.csv${qs}">Download print CSV</a></div>
+      </div>
+    </div>`;
+
+	return c.html(page(c, "Reports", body));
+});
+
+app.get("/reports/jobs.csv", async (c) => {
+	const from = c.req.query("from") || "";
+	const to = c.req.query("to") || "";
+	const where: string[] = ["1=1"];
+	const binds: string[] = [];
+	if (from) {
+		where.push("date(COALESCE(j.scheduled_start, j.created_at)) >= date(?)");
+		binds.push(from);
+	}
+	if (to) {
+		where.push("date(COALESCE(j.scheduled_start, j.created_at)) <= date(?)");
+		binds.push(to);
+	}
+
+	const sql = `SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, j.scheduled_end,
+      j.estimate_cents, j.invoice_cents, j.claim_number, j.carrier, j.date_of_loss, j.created_at,
+      c.name AS customer_name, c.phone AS customer_phone,
+      s.address_line1, s.city, s.state, s.postal_code,
+      u.name AS assignee_name, COALESCE(u.designation, u.role) AS assignee_designation
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN sites s ON s.id = j.site_id
+     LEFT JOIN users u ON u.id = j.assigned_user_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY COALESCE(j.scheduled_start, j.created_at) ASC
+     LIMIT 5000`;
+
+	const stmt = c.env.DB.prepare(sql);
+	const result = binds.length ? await stmt.bind(...binds).all() : await stmt.all();
+	const rows = ((result.results || []) as Array<Record<string, unknown>>).map(
+		(j) => [
+			j.id as string,
+			j.title as string,
+			j.customer_name as string,
+			j.customer_phone as string,
+			[j.address_line1, j.city, j.state, j.postal_code].filter(Boolean).join(", "),
+			j.job_type as string,
+			j.status as string,
+			j.assignee_name as string,
+			j.assignee_designation as string,
+			j.scheduled_start as string,
+			j.scheduled_end as string,
+			j.claim_number as string,
+			j.carrier as string,
+			j.date_of_loss as string,
+			j.estimate_cents as number,
+			j.invoice_cents as number,
+			j.created_at as string,
+		],
+	);
+
+	return csvResponse(
+		"lumanyi-jobs-rich.csv",
+		[
+			"id",
+			"title",
+			"customer",
+			"customer_phone",
+			"site",
+			"job_type",
+			"status",
+			"assignee",
+			"assignee_designation",
+			"scheduled_start",
+			"scheduled_end",
+			"claim_number",
+			"carrier",
+			"date_of_loss",
+			"estimate_cents",
+			"invoice_cents",
+			"created_at",
+		],
+		rows,
+	);
+});
+
+app.get("/reports/field-logs.csv", async (c) => {
+	const from = c.req.query("from") || "";
+	const to = c.req.query("to") || "";
+	const where: string[] = ["1=1"];
+	const binds: string[] = [];
+	if (from) {
+		where.push("date(l.logged_at) >= date(?)");
+		binds.push(from);
+	}
+	if (to) {
+		where.push("date(l.logged_at) <= date(?)");
+		binds.push(to);
+	}
+
+	const sql = `SELECT l.id, l.kind, l.logged_at, l.area, l.reading, l.equipment_type,
+      l.equipment_count, l.notes, l.created_at,
+      j.id AS job_id, j.title AS job_title, j.job_type,
+      c.name AS customer_name, u.name AS logged_by
+     FROM job_field_logs l
+     JOIN jobs j ON j.id = l.job_id
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN users u ON u.id = l.created_by
+     WHERE ${where.join(" AND ")}
+     ORDER BY l.logged_at ASC, l.created_at ASC
+     LIMIT 10000`;
+
+	const stmt = c.env.DB.prepare(sql);
+	const result = binds.length ? await stmt.bind(...binds).all() : await stmt.all();
+	const rows = ((result.results || []) as Array<Record<string, unknown>>).map(
+		(r) => [
+			r.id as string,
+			r.job_id as string,
+			r.job_title as string,
+			r.job_type as string,
+			r.customer_name as string,
+			r.kind as string,
+			r.logged_at as string,
+			r.area as string,
+			r.reading as string,
+			r.equipment_type as string,
+			r.equipment_count as number,
+			r.notes as string,
+			r.logged_by as string,
+			r.created_at as string,
+		],
+	);
+
+	return csvResponse(
+		"lumanyi-field-logs.csv",
+		[
+			"id",
+			"job_id",
+			"job_title",
+			"job_type",
+			"customer",
+			"kind",
+			"logged_at",
+			"area",
+			"reading",
+			"equipment_type",
+			"equipment_count",
+			"notes",
+			"logged_by",
+			"created_at",
+		],
+		rows,
+	);
+});
+
+app.get("/reports/inventory.csv", async (c) => {
+	const from = c.req.query("from") || "";
+	const to = c.req.query("to") || "";
+	const where: string[] = ["1=1"];
+	const binds: string[] = [];
+	if (from) {
+		where.push("date(je.assigned_at) >= date(?)");
+		binds.push(from);
+	}
+	if (to) {
+		where.push("date(je.assigned_at) <= date(?)");
+		binds.push(to);
+	}
+
+	const sql = `SELECT je.id, je.assigned_at, je.returned_at, je.notes AS assignment_notes,
+      a.label AS asset_label, a.equipment_type, a.serial, a.status AS asset_status,
+      j.id AS job_id, j.title AS job_title, c.name AS customer_name
+     FROM job_equipment je
+     JOIN equipment_assets a ON a.id = je.asset_id
+     JOIN jobs j ON j.id = je.job_id
+     JOIN customers c ON c.id = j.customer_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY je.assigned_at ASC
+     LIMIT 10000`;
+
+	const stmt = c.env.DB.prepare(sql);
+	const result = binds.length ? await stmt.bind(...binds).all() : await stmt.all();
+	const rows = ((result.results || []) as Array<Record<string, unknown>>).map(
+		(r) => [
+			r.id as string,
+			r.asset_label as string,
+			r.equipment_type as string,
+			r.serial as string,
+			r.asset_status as string,
+			r.job_id as string,
+			r.job_title as string,
+			r.customer_name as string,
+			r.assigned_at as string,
+			r.returned_at as string,
+			r.assignment_notes as string,
+		],
+	);
+
+	return csvResponse(
+		"lumanyi-inventory-assignments.csv",
+		[
+			"assignment_id",
+			"asset_label",
+			"equipment_type",
+			"serial",
+			"asset_status",
+			"job_id",
+			"job_title",
+			"customer",
+			"assigned_at",
+			"returned_at",
+			"notes",
+		],
+		rows,
+	);
+});
+
+app.get("/reports/print.csv", async (c) => {
+	const from = c.req.query("from") || "";
+	const to = c.req.query("to") || "";
+	const where: string[] = ["1=1"];
+	const binds: string[] = [];
+	if (from) {
+		where.push("date(p.updated_at) >= date(?)");
+		binds.push(from);
+	}
+	if (to) {
+		where.push("date(p.updated_at) <= date(?)");
+		binds.push(to);
+	}
+
+	const sql = `SELECT p.id, p.title, p.product_type, p.status, p.quantity, p.due_date,
+      p.estimate_cents, p.delivery_method, p.revise_count, p.created_at, p.updated_at,
+      c.name AS customer_name, u.name AS assignee_name
+     FROM print_jobs p
+     LEFT JOIN customers c ON c.id = p.customer_id
+     LEFT JOIN users u ON u.id = p.assigned_user_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY p.updated_at ASC
+     LIMIT 5000`;
+
+	const stmt = c.env.DB.prepare(sql);
+	const result = binds.length ? await stmt.bind(...binds).all() : await stmt.all();
+	const rows = ((result.results || []) as Array<Record<string, unknown>>).map(
+		(r) => [
+			r.id as string,
+			r.title as string,
+			r.customer_name as string,
+			r.product_type as string,
+			r.status as string,
+			r.quantity as number,
+			r.due_date as string,
+			r.estimate_cents as number,
+			r.delivery_method as string,
+			r.revise_count as number,
+			r.assignee_name as string,
+			r.created_at as string,
+			r.updated_at as string,
+		],
+	);
+
+	return csvResponse(
+		"lumanyi-print-jobs.csv",
+		[
+			"id",
+			"title",
+			"customer",
+			"product_type",
+			"status",
+			"quantity",
+			"due_date",
+			"estimate_cents",
+			"delivery_method",
+			"revise_count",
+			"assignee",
+			"created_at",
+			"updated_at",
+		],
+		rows,
+	);
 });
 
 app.get("/recurring", async (c) => {

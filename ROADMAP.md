@@ -69,7 +69,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 
 - [x] Moisture / equipment logs on restoration jobs
 - [x] Inventory / equipment tracking
-- [ ] Reporting / CSV depth
+- [x] Reporting / CSV depth
 - [ ] Client portal (optional)
 
 ## Phase 6 — Multi-brand
