@@ -134,6 +134,15 @@ import {
 	verifyOwnerPasswordForHardDelete,
 } from "./lib/hard-delete";
 import {
+	canViewAudit,
+	clientIpFromHeaders,
+	listAuditEvents,
+	requestIdFromHeaders,
+	writeAuditEvent,
+	type AuditAction,
+	type AuditEntityType,
+} from "./lib/audit";
+import {
 	canSetAssetStatusWithOpenAssignment,
 	canVoidClaimData,
 	normalizeVoidReason,
@@ -231,6 +240,38 @@ async function requireHardDeletePassword(
 		return c.text("Password incorrect — hard delete cancelled.", 403);
 	}
 	return null;
+}
+
+function auditMeta(c: Context<{ Bindings: Env; Variables: Variables }>) {
+	const headers = {
+		get: (name: string) => c.req.header(name) ?? null,
+	};
+	return {
+		actorUserId: c.get("user")!.id,
+		ip: clientIpFromHeaders(headers),
+		requestId: requestIdFromHeaders(headers),
+	};
+}
+
+async function recordAudit(
+	c: Context<{ Bindings: Env; Variables: Variables }>,
+	input: {
+		action: AuditAction;
+		entityType: AuditEntityType;
+		entityId: string;
+		summary: string;
+		detail?: Record<string, unknown> | null;
+	},
+) {
+	const meta = auditMeta(c);
+	await writeAuditEvent(c.env.DB, {
+		...meta,
+		action: input.action,
+		entityType: input.entityType,
+		entityId: input.entityId,
+		summary: input.summary,
+		detail: input.detail,
+	});
 }
 
 async function loadFieldJobAccess(
@@ -1114,12 +1155,13 @@ app.post("/users", async (c) => {
 			: defaultProductsForDesignation(designation),
 	);
 	const passwordHash = await hashPassword(tempPassword);
+	const newUserId = newId("usr");
 	await c.env.DB.prepare(
 		`INSERT INTO users (id, email, name, password_hash, role, designation, products, must_change_password, active)
      VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1)`,
 	)
 		.bind(
-			newId("usr"),
+			newUserId,
 			email,
 			name,
 			passwordHash,
@@ -1128,6 +1170,13 @@ app.post("/users", async (c) => {
 			products,
 		)
 		.run();
+	await recordAudit(c, {
+		action: "user_create",
+		entityType: "user",
+		entityId: newUserId,
+		summary: `Created user ${email} (${designation})`,
+		detail: { email, designation, permissionRole, products },
+	});
 	return c.redirect("/users");
 });
 
@@ -1137,10 +1186,10 @@ app.post("/users/:id/products", async (c) => {
 	const form = await c.req.parseBody();
 	const selected = productsSelectedFromForm(form as Record<string, unknown>);
 	const row = await c.env.DB.prepare(
-		`SELECT id, COALESCE(designation, role) AS designation FROM users WHERE id = ?`,
+		`SELECT id, products, COALESCE(designation, role) AS designation FROM users WHERE id = ?`,
 	)
 		.bind(id)
-		.first<{ id: string; designation: string }>();
+		.first<{ id: string; products: string | null; designation: string }>();
 	if (!row) return c.notFound();
 	const products = serializeProducts(
 		selected.length
@@ -1150,6 +1199,13 @@ app.post("/users/:id/products", async (c) => {
 	await c.env.DB.prepare(`UPDATE users SET products = ? WHERE id = ?`)
 		.bind(products, id)
 		.run();
+	await recordAudit(c, {
+		action: "user_products",
+		entityType: "user",
+		entityId: id,
+		summary: `Updated products for user ${id}`,
+		detail: { before: row.products, after: products },
+	});
 	return c.redirect("/users");
 });
 
@@ -1161,10 +1217,10 @@ app.post("/users/:id/designation", async (c) => {
 	if (!isValidUserRole(rawRole)) return c.text("Invalid designation", 400);
 
 	const row = await c.env.DB.prepare(
-		`SELECT id, role, COALESCE(active, 1) AS active FROM users WHERE id = ?`,
+		`SELECT id, role, COALESCE(designation, role) AS designation, COALESCE(active, 1) AS active FROM users WHERE id = ?`,
 	)
 		.bind(id)
-		.first<{ id: string; role: string; active: number }>();
+		.first<{ id: string; role: string; designation: string; active: number }>();
 	if (!row) return c.notFound();
 
 	const nextPermission = permissionRoleFor(rawRole);
@@ -1195,6 +1251,16 @@ app.post("/users/:id/designation", async (c) => {
 	)
 		.bind(nextPermission, rawRole, id)
 		.run();
+	await recordAudit(c, {
+		action: "user_designation",
+		entityType: "user",
+		entityId: id,
+		summary: `Changed designation ${row.designation} → ${rawRole}`,
+		detail: {
+			before: { designation: row.designation, role: row.role },
+			after: { designation: rawRole, role: nextPermission },
+		},
+	});
 	return c.redirect("/users");
 });
 
@@ -1229,6 +1295,13 @@ app.post("/users/:id/active", async (c) => {
 			.bind(id)
 			.run();
 		await destroySessionsForUser(c.env.DB, id);
+		await recordAudit(c, {
+			action: "user_deactivate",
+			entityType: "user",
+			entityId: id,
+			summary: `Deactivated user ${id}`,
+			detail: { role: row.role },
+		});
 	} else {
 		if (row.role === "owner") {
 			const seats = await countActiveOwners(c.env.DB);
@@ -1242,6 +1315,13 @@ app.post("/users/:id/active", async (c) => {
 		await c.env.DB.prepare(`UPDATE users SET active = 1 WHERE id = ?`)
 			.bind(id)
 			.run();
+		await recordAudit(c, {
+			action: "user_reactivate",
+			entityType: "user",
+			entityId: id,
+			summary: `Reactivated user ${id}`,
+			detail: { role: row.role },
+		});
 	}
 	return c.redirect("/users");
 });
@@ -1260,6 +1340,12 @@ app.post("/customers/:id/archive", async (c) => {
 	)
 		.bind(id)
 		.run();
+	await recordAudit(c, {
+		action: "soft_delete",
+		entityType: "customer",
+		entityId: id,
+		summary: `Archived customer ${id}`,
+	});
 	return c.redirect("/trash");
 });
 
@@ -1277,6 +1363,12 @@ app.post("/jobs/:id/archive", async (c) => {
 	)
 		.bind(id)
 		.run();
+	await recordAudit(c, {
+		action: "soft_delete",
+		entityType: "job",
+		entityId: id,
+		summary: `Archived field job ${id}`,
+	});
 	return c.redirect("/trash");
 });
 
@@ -1294,6 +1386,12 @@ app.post("/print/:id/archive", async (c) => {
 	)
 		.bind(id)
 		.run();
+	await recordAudit(c, {
+		action: "soft_delete",
+		entityType: "print_job",
+		entityId: id,
+		summary: `Archived print job ${id}`,
+	});
 	return c.redirect("/trash");
 });
 
@@ -1402,7 +1500,7 @@ app.get("/trash", async (c) => {
     <p class="muted">Soft-deleted records. Restore returns them to daily lists.
       <strong>Delete forever</strong> is Owner-only, requires your password, and cannot be undone.
       Deleting a customer also wipes every field/print job under that customer (privacy wipe).
-      Immutable audit log for these actions ships in SA-5.</p>
+      These actions are recorded in the <a href="/audit">Audit log</a>.</p>
     <h2>Customers</h2>
     <table>
       <thead><tr><th>Name</th><th>Archived</th><th>Restore</th><th>Hard delete</th></tr></thead>
@@ -1430,6 +1528,12 @@ app.post("/trash/customers/:id/restore", async (c) => {
 	)
 		.bind(id)
 		.run();
+	await recordAudit(c, {
+		action: "restore",
+		entityType: "customer",
+		entityId: id,
+		summary: `Restored customer ${id}`,
+	});
 	return c.redirect(`/customers/${id}`);
 });
 
@@ -1442,6 +1546,12 @@ app.post("/trash/jobs/:id/restore", async (c) => {
 	)
 		.bind(id)
 		.run();
+	await recordAudit(c, {
+		action: "restore",
+		entityType: "job",
+		entityId: id,
+		summary: `Restored field job ${id}`,
+	});
 	return c.redirect(`/jobs/${id}`);
 });
 
@@ -1454,6 +1564,12 @@ app.post("/trash/print/:id/restore", async (c) => {
 	)
 		.bind(id)
 		.run();
+	await recordAudit(c, {
+		action: "restore",
+		entityType: "print_job",
+		entityId: id,
+		summary: `Restored print job ${id}`,
+	});
 	return c.redirect(`/print/${id}`);
 });
 
@@ -1463,6 +1579,12 @@ app.post("/trash/customers/:id/hard-delete", async (c) => {
 	const id = c.req.param("id");
 	const result = await hardDeleteCustomer(c.env.DB, c.env.UPLOADS, id);
 	if (!result.ok) return c.text(result.error, result.status);
+	await recordAudit(c, {
+		action: "hard_delete",
+		entityType: "customer",
+		entityId: id,
+		summary: `Hard-deleted customer ${id} (and related jobs)`,
+	});
 	return c.redirect("/trash");
 });
 
@@ -1472,6 +1594,12 @@ app.post("/trash/jobs/:id/hard-delete", async (c) => {
 	const id = c.req.param("id");
 	const result = await hardDeleteFieldJob(c.env.DB, c.env.UPLOADS, id);
 	if (!result.ok) return c.text(result.error, result.status);
+	await recordAudit(c, {
+		action: "hard_delete",
+		entityType: "job",
+		entityId: id,
+		summary: `Hard-deleted field job ${id}`,
+	});
 	return c.redirect("/trash");
 });
 
@@ -1481,7 +1609,46 @@ app.post("/trash/print/:id/hard-delete", async (c) => {
 	const id = c.req.param("id");
 	const result = await hardDeletePrintJob(c.env.DB, c.env.UPLOADS, id);
 	if (!result.ok) return c.text(result.error, result.status);
+	await recordAudit(c, {
+		action: "hard_delete",
+		entityType: "print_job",
+		entityId: id,
+		summary: `Hard-deleted print job ${id}`,
+	});
 	return c.redirect("/trash");
+});
+
+app.get("/audit", async (c) => {
+	if (!canViewAudit(c.get("user")!)) {
+		return c.html(
+			forbiddenHtml(c, "Audit log is Super Admin / Owner only."),
+			403,
+		);
+	}
+	const events = await listAuditEvents(c.env.DB, 200);
+	const rows =
+		events
+			.map(
+				(e) => `<tr>
+        <td class="muted" style="white-space:nowrap">${escapeHtml(e.created_at.slice(0, 19).replace("T", " "))}</td>
+        <td>${escapeHtml(e.actor_name) || `<span class="muted">${escapeHtml(e.actor_user_id) || "—"}</span>`}</td>
+        <td>${escapeHtml(e.action)}</td>
+        <td>${escapeHtml(e.entity_type)}<br><code style="font-size:0.75rem">${escapeHtml(e.entity_id)}</code></td>
+        <td>${escapeHtml(e.summary)}</td>
+        <td class="muted" style="font-size:0.8rem">${escapeHtml(e.ip) || "—"}<br>${escapeHtml(e.request_id) || "—"}</td>
+      </tr>`,
+			)
+			.join("") || `<tr><td colspan="6" class="muted">No audit events yet.</td></tr>`;
+
+	const body = `
+    <h1>Audit log</h1>
+    <p class="muted">Append-only ledger of Super Admin governance actions (soft/hard delete, restore, void, user create/deactivate/role/products).
+      Rows cannot be edited or deleted — even by Owners. Showing latest 200.</p>
+    <table>
+      <thead><tr><th>When (UTC)</th><th>Actor</th><th>Action</th><th>Entity</th><th>Summary</th><th>IP / Request</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+	return c.html(page(c, "Audit", body));
 });
 
 app.get("/", async (c) => {
@@ -3854,6 +4021,13 @@ app.post("/jobs/:id/logs/:logId/void", async (c) => {
 	)
 		.bind(id)
 		.run();
+	await recordAudit(c, {
+		action: "void",
+		entityType: "field_log",
+		entityId: logId,
+		summary: `Voided field log on job ${id}`,
+		detail: { jobId: id, reason },
+	});
 	return c.redirect(`/jobs/${id}`);
 });
 
@@ -4445,6 +4619,13 @@ app.post("/jobs/:id/photos/:photoId/void", async (c) => {
 	)
 		.bind(id)
 		.run();
+	await recordAudit(c, {
+		action: "void",
+		entityType: "job_photo",
+		entityId: photoId,
+		summary: `Voided photo on job ${id}`,
+		detail: { jobId: id, reason },
+	});
 	return c.redirect(`/jobs/${id}`);
 });
 
@@ -4548,6 +4729,13 @@ app.post("/jobs/:id/moisture-maps/:mapId/void", async (c) => {
 	)
 		.bind(id)
 		.run();
+	await recordAudit(c, {
+		action: "void",
+		entityType: "moisture_map",
+		entityId: mapId,
+		summary: `Voided moisture map on job ${id}`,
+		detail: { jobId: id, reason },
+	});
 	return c.redirect(`/jobs/${id}`);
 });
 

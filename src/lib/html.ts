@@ -6,6 +6,7 @@ import {
 	canSeeOfficeTools,
 } from "./access";
 import { canAccessTrash } from "./soft-delete";
+import { canViewAudit } from "./audit";
 
 export function escapeHtml(value: string | number | null | undefined): string {
 	return String(value ?? "")
@@ -47,7 +48,10 @@ export function layout(opts: {
 		items.push({ href: "/calendar", label: "Calendar" });
 		if (canManageUsers(u)) {
 			items.push({ href: "/users", label: "Users" });
+		}
+		if (canAccessTrash(u)) {
 			items.push({ href: "/trash", label: "Trash" });
+			items.push({ href: "/audit", label: "Audit" });
 		}
 		items.push({ href: "/inventory", label: "Inventory" });
 		if (canSeeOfficeTools(u)) {

@@ -87,6 +87,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] SA-2: Soft delete (archive) for customers / field jobs / print jobs + Owner Trash restore
 - [x] SA-3: Void moisture / photos / field logs / moisture maps (reason required; no erase) + block inventory status change while on open job
 - [x] SA-4: Owner hard delete from Trash (password re-entry; customers / field jobs / print jobs + R2)
+- [x] SA-5: Append-only audit log (soft/hard delete, restore, void, user admin) + Owner read-only Audit page
 
 ## Phase 6 — Multi-brand
 
