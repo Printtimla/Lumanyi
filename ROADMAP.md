@@ -75,7 +75,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 ## A-tier — Restoration depth
 
 - [x] Lead pipeline (`/leads`, source + follow-up)
-- [ ] Job cost tracking (labor / materials / equipment days)
+- [x] Job cost tracking (labor / materials / equipment days)
 
 ## Phase 6 — Multi-brand
 

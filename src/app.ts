@@ -81,6 +81,16 @@ import {
 	leadSourceLabel,
 	normalizeLeadSource,
 } from "./lib/leads";
+import {
+	COST_CATEGORIES,
+	costCategoryLabel,
+	defaultUnitForCategory,
+	isValidCostCategory,
+	lineTotalCents,
+	loadJobCostLines,
+	marginCents,
+	sumCostCents,
+} from "./lib/job-costs";
 
 const RESTORATION_SQL_TYPES = [
 	...RESTORATION_TYPES.map((t) => t.value),
@@ -2126,6 +2136,80 @@ app.get("/jobs/:id", async (c) => {
     </table>`;
 	}
 
+	const costLines = await loadJobCostLines(c.env.DB, id);
+	const costTotal = sumCostCents(costLines);
+	const jobMargin = marginCents(job.estimate_cents, costTotal);
+	const costByCategory = COST_CATEGORIES.map((cat) => {
+		const sub = sumCostCents(
+			costLines.filter((l) => l.category === cat.value),
+		);
+		return { ...cat, sub };
+	}).filter((c) => c.sub > 0);
+
+	const costRows =
+		costLines
+			.map(
+				(l) => `<tr>
+        <td>${escapeHtml(costCategoryLabel(l.category))}</td>
+        <td>${escapeHtml(l.description)}</td>
+        <td>${escapeHtml(l.quantity)} ${escapeHtml(l.unit)}</td>
+        <td>${escapeHtml(money(l.unit_cents))}</td>
+        <td>${escapeHtml(money(lineTotalCents(l.quantity, l.unit_cents)))}</td>
+        <td>
+          <form method="post" action="/jobs/${escapeHtml(id)}/costs/${escapeHtml(l.id)}/delete" class="inline"
+            onsubmit="return confirm('Delete this cost line?');">
+            <button class="linkish" type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>`,
+			)
+			.join("") ||
+		`<tr><td colspan="6" class="muted">No cost lines yet.</td></tr>`;
+
+	const costCategoryOptions = COST_CATEGORIES.map(
+		(c) =>
+			`<option value="${escapeHtml(c.value)}">${escapeHtml(c.label)}</option>`,
+	).join("");
+
+	const costBreakdown =
+		costByCategory
+			.map(
+				(c) =>
+					`${escapeHtml(c.label)} ${escapeHtml(money(c.sub))}`,
+			)
+			.join(" · ") || "—";
+
+	const costSection = `
+    <h2>Job costs</h2>
+    <p class="muted">Track labor, materials, and equipment days against the estimate. Internal only — not payroll.</p>
+    <div class="panel" style="margin-bottom:1rem">
+      <strong>Cost total:</strong> ${escapeHtml(money(costTotal))}
+      · <strong>Estimate:</strong> ${escapeHtml(money(job.estimate_cents))}
+      · <strong>Margin:</strong> ${jobMargin == null ? "—" : escapeHtml(money(jobMargin))}
+      <div class="muted" style="margin-top:0.35rem;font-size:0.85rem">${costBreakdown}</div>
+    </div>
+    <form method="post" action="/jobs/${escapeHtml(id)}/costs" class="panel stack" style="margin-bottom:1rem">
+      <div class="row">
+        <div><label for="cost_category">Category</label>
+          <select id="cost_category" name="category" required>${costCategoryOptions}</select></div>
+        <div class="grow"><label for="cost_description">Description</label>
+          <input id="cost_description" name="description" required placeholder="Tech hours, poly sheeting, dehumidifier days…" /></div>
+      </div>
+      <div class="row">
+        <div><label for="cost_qty">Qty</label>
+          <input id="cost_qty" name="quantity" type="number" step="0.01" min="0" value="1" required /></div>
+        <div><label for="cost_unit">Unit</label>
+          <input id="cost_unit" name="unit" placeholder="hr / ea / day" /></div>
+        <div><label for="cost_unit_dollars">Unit cost ($)</label>
+          <input id="cost_unit_dollars" name="unit_dollars" type="number" step="0.01" min="0" required /></div>
+      </div>
+      <button class="btn" type="submit">Add cost line</button>
+    </form>
+    <table>
+      <thead><tr><th>Category</th><th>Description</th><th>Qty</th><th>Unit $</th><th>Total</th><th></th></tr></thead>
+      <tbody>${costRows}</tbody>
+    </table>`;
+
 	const statusOptions = [
 		"lead",
 		"estimate",
@@ -2191,6 +2275,7 @@ app.get("/jobs/:id", async (c) => {
           ${job.scheduled_end ? ` → ${escapeHtml(job.scheduled_end.slice(0, 16).replace("T", " "))}` : ""}
         </div>
         <div><span class="muted">Estimate</span><br>${escapeHtml(money(job.estimate_cents))} <a href="/jobs/${escapeHtml(id)}/estimate">edit lines</a></div>
+        <div><span class="muted">Job cost</span><br>${escapeHtml(money(costTotal))} · margin ${jobMargin == null ? "—" : escapeHtml(money(jobMargin))}</div>
         <div><span class="muted">Invoice</span><br>${escapeHtml(money(job.invoice_cents))}</div>
         <div><span class="muted">Claim #</span><br>${escapeHtml(job.claim_number) || "—"}</div>
         <div><span class="muted">Carrier</span><br>${escapeHtml(job.carrier) || "—"}</div>
@@ -2260,6 +2345,8 @@ app.get("/jobs/:id", async (c) => {
     <h2>Checklist</h2>
     <div class="panel"><ul class="checklist">${checkItems}</ul></div>
 
+    ${costSection}
+
     ${fieldLogSection}
 
     <h2>Field notes</h2>
@@ -2317,6 +2404,80 @@ app.post("/jobs/:id", async (c) => {
 			String(form.follow_up_at || "").trim() || null,
 			id,
 		)
+		.run();
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/costs", async (c) => {
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(`SELECT id FROM jobs WHERE id = ?`)
+		.bind(id)
+		.first();
+	if (!job) return c.notFound();
+
+	const form = await c.req.parseBody();
+	const category = String(form.category || "").trim();
+	if (!isValidCostCategory(category)) {
+		return c.text("Invalid cost category", 400);
+	}
+	const description = String(form.description || "").trim();
+	if (!description) return c.text("Description required", 400);
+
+	const qty = parseFloat(String(form.quantity || "1"));
+	if (!Number.isFinite(qty) || qty < 0) {
+		return c.text("Invalid quantity", 400);
+	}
+	const unitRaw = String(form.unit || "").trim();
+	const unit = unitRaw || defaultUnitForCategory(category);
+	const dollars = parseFloat(String(form.unit_dollars || "0"));
+	if (!Number.isFinite(dollars) || dollars < 0) {
+		return c.text("Invalid unit cost", 400);
+	}
+	const unitCents = Math.round(dollars * 100);
+
+	const count = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS c FROM job_cost_lines WHERE job_id = ?`,
+	)
+		.bind(id)
+		.first<{ c: number }>();
+
+	await c.env.DB.prepare(
+		`INSERT INTO job_cost_lines (id, job_id, category, description, quantity, unit, unit_cents, sort_order)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			newId("cost"),
+			id,
+			category,
+			description,
+			qty,
+			unit,
+			unitCents,
+			count?.c ?? 0,
+		)
+		.run();
+
+	await c.env.DB.prepare(
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
+		.run();
+
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/costs/:lineId/delete", async (c) => {
+	const id = c.req.param("id");
+	const lineId = c.req.param("lineId");
+	await c.env.DB.prepare(
+		`DELETE FROM job_cost_lines WHERE id = ? AND job_id = ?`,
+	)
+		.bind(lineId, id)
+		.run();
+	await c.env.DB.prepare(
+		`UPDATE jobs SET updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(id)
 		.run();
 	return c.redirect(`/jobs/${id}`);
 });
