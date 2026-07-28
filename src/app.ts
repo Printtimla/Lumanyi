@@ -755,37 +755,125 @@ app.post("/users", async (c) => {
 });
 
 app.get("/", async (c) => {
-	const counts = await c.env.DB.prepare(
+	const today = new Date().toISOString().slice(0, 10);
+
+	const fieldCounts = await c.env.DB.prepare(
 		`SELECT
-      SUM(CASE WHEN status IN ('lead','estimate') THEN 1 ELSE 0 END) AS pipeline,
-      SUM(CASE WHEN status = 'scheduled' THEN 1 ELSE 0 END) AS scheduled,
-      SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS active,
-      SUM(CASE WHEN status IN ('complete','invoiced') THEN 1 ELSE 0 END) AS done
+      SUM(CASE WHEN status = 'lead' THEN 1 ELSE 0 END) AS lead_n,
+      SUM(CASE WHEN status = 'estimate' THEN 1 ELSE 0 END) AS estimate_n,
+      SUM(CASE WHEN status = 'scheduled' THEN 1 ELSE 0 END) AS scheduled_n,
+      SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS active_n,
+      SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) AS complete_n,
+      SUM(CASE WHEN status = 'invoiced' THEN 1 ELSE 0 END) AS invoiced_n
      FROM jobs WHERE status != 'cancelled'`,
 	).first<{
-		pipeline: number;
-		scheduled: number;
-		active: number;
-		done: number;
+		lead_n: number;
+		estimate_n: number;
+		scheduled_n: number;
+		active_n: number;
+		complete_n: number;
+		invoiced_n: number;
 	}>();
+
+	const printCounts = await c.env.DB.prepare(
+		`SELECT
+      SUM(CASE WHEN status = 'intake' THEN 1 ELSE 0 END) AS intake_n,
+      SUM(CASE WHEN status = 'proof' THEN 1 ELSE 0 END) AS proof_n,
+      SUM(CASE WHEN status IN ('approved','in_production') THEN 1 ELSE 0 END) AS press_n,
+      SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready_n
+     FROM print_jobs WHERE status != 'cancelled'`,
+	).first<{
+		intake_n: number;
+		proof_n: number;
+		press_n: number;
+		ready_n: number;
+	}>();
+
+	const overdue = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.follow_up_at, j.status, c.name AS customer_name
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     WHERE j.status IN ('lead','estimate')
+       AND j.follow_up_at IS NOT NULL
+       AND date(j.follow_up_at) < date(?)
+     ORDER BY j.follow_up_at ASC
+     LIMIT 8`,
+	)
+		.bind(today)
+		.all<{
+			id: string;
+			title: string;
+			follow_up_at: string;
+			status: string;
+			customer_name: string;
+		}>();
+
+	const todayJobs = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     WHERE j.status IN ('scheduled','in_progress')
+       AND j.scheduled_start IS NOT NULL
+       AND date(j.scheduled_start) = date(?)
+     ORDER BY j.scheduled_start ASC
+     LIMIT 12`,
+	)
+		.bind(today)
+		.all<{
+			id: string;
+			title: string;
+			job_type: string;
+			status: string;
+			scheduled_start: string | null;
+			customer_name: string;
+		}>();
 
 	const upcoming = await c.env.DB.prepare(
 		`SELECT j.id, j.title, j.job_type, j.status, j.scheduled_start, c.name AS customer_name
      FROM jobs j
      JOIN customers c ON c.id = j.customer_id
      WHERE j.status IN ('scheduled','in_progress')
+       AND (j.scheduled_start IS NULL OR date(j.scheduled_start) > date(?))
      ORDER BY COALESCE(j.scheduled_start, '9999') ASC
      LIMIT 8`,
-	).all<{
-		id: string;
-		title: string;
-		job_type: string;
-		status: string;
-		scheduled_start: string | null;
-		customer_name: string;
-	}>();
+	)
+		.bind(today)
+		.all<{
+			id: string;
+			title: string;
+			job_type: string;
+			status: string;
+			scheduled_start: string | null;
+			customer_name: string;
+		}>();
 
-	const rows =
+	const overdueRows =
+		overdue.results
+			?.map(
+				(j) => `<tr>
+        <td><a href="/jobs/${escapeHtml(j.id)}">${escapeHtml(j.title)}</a></td>
+        <td>${escapeHtml(j.customer_name)}</td>
+        <td><span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span></td>
+        <td style="color:var(--danger);font-weight:600">${escapeHtml(j.follow_up_at.slice(0, 10))}</td>
+      </tr>`,
+			)
+			.join("") || "";
+
+	const todayRows =
+		todayJobs.results
+			?.map(
+				(j) => `<tr>
+        <td><a href="/jobs/${escapeHtml(j.id)}">${escapeHtml(j.title)}</a></td>
+        <td>${escapeHtml(j.customer_name)}</td>
+        <td>${escapeHtml(jobTypeLabel(j.job_type))}</td>
+        <td><span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span></td>
+        <td>${escapeHtml(j.scheduled_start ? j.scheduled_start.slice(0, 16).replace("T", " ") : "—")}</td>
+      </tr>`,
+			)
+			.join("") ||
+		`<tr><td colspan="5" class="muted">Nothing scheduled for today.</td></tr>`;
+
+	const upcomingRows =
 		upcoming.results
 			?.map(
 				(j) => `<tr>
@@ -796,7 +884,8 @@ app.get("/", async (c) => {
         <td>${escapeHtml(j.scheduled_start ? j.scheduled_start.slice(0, 16).replace("T", " ") : "—")}</td>
       </tr>`,
 			)
-			.join("") || `<tr><td colspan="5" class="muted">No scheduled jobs yet.</td></tr>`;
+			.join("") ||
+		`<tr><td colspan="5" class="muted">No later scheduled jobs.</td></tr>`;
 
 	const productCards = PRODUCTS.map(
 		(p) => `<a class="product-card" href="${escapeHtml(p.href)}">
@@ -807,28 +896,77 @@ app.get("/", async (c) => {
     </a>`,
 	).join("");
 
+	const fc = fieldCounts;
+	const pc = printCounts;
+	const overdueCount = overdue.results?.length ?? 0;
+
 	const body = `
-    <h1>Lumanyi</h1>
-    <p class="muted">Choose a product. Shared customers, calendar, and users sit underneath.</p>
-    <div class="product-grid">${productCards}</div>
-    <div class="grid" style="margin:1.5rem 0">
-      <div class="stat"><div class="n">${counts?.pipeline ?? 0}</div><div class="l">Field pipeline</div></div>
-      <div class="stat"><div class="n">${counts?.scheduled ?? 0}</div><div class="l">Scheduled</div></div>
-      <div class="stat"><div class="n">${counts?.active ?? 0}</div><div class="l">In progress</div></div>
-      <div class="stat"><div class="n">${counts?.done ?? 0}</div><div class="l">Complete / invoiced</div></div>
+    <h1>Ops dashboard</h1>
+    <p class="muted">Live snapshot for ${escapeHtml(today)}. Product shells below.</p>
+
+    <div class="quick-links">
+      <a href="/leads">Leads</a>
+      <a href="/calendar">Calendar</a>
+      <a href="/restoration">Restoration</a>
+      <a href="/floors">Floors</a>
+      <a href="/print/board">Press board</a>
+      <a href="/reports">Reports</a>
+      <a href="/inventory">Inventory</a>
+      <a href="/customers/new">New customer</a>
     </div>
-    <div class="toolbar">
-      <a class="btn" href="/restoration">New restoration job</a>
-      <a class="btn secondary" href="/floors">Floor jobs</a>
-      <a class="btn secondary" href="/customers/new">New customer</a>
+
+    <h2 style="margin-top:0.5rem">Field jobs</h2>
+    <div class="grid" style="margin-bottom:1rem">
+      <a class="stat" href="/leads?stage=lead"><div class="n">${fc?.lead_n ?? 0}</div><div class="l">Lead</div></a>
+      <a class="stat" href="/leads?stage=estimate"><div class="n">${fc?.estimate_n ?? 0}</div><div class="l">Estimate</div></a>
+      <a class="stat" href="/jobs?status=scheduled"><div class="n">${fc?.scheduled_n ?? 0}</div><div class="l">Scheduled</div></a>
+      <a class="stat" href="/jobs?status=in_progress"><div class="n">${fc?.active_n ?? 0}</div><div class="l">In progress</div></a>
+      <a class="stat" href="/jobs?status=complete"><div class="n">${fc?.complete_n ?? 0}</div><div class="l">Complete</div></a>
+      <a class="stat" href="/jobs?status=invoiced"><div class="n">${fc?.invoiced_n ?? 0}</div><div class="l">Invoiced</div></a>
     </div>
-    <h2>Up next (field)</h2>
+
+    <h2>Print jobs</h2>
+    <div class="grid" style="margin-bottom:1rem">
+      <a class="stat" href="/print?status=intake"><div class="n">${pc?.intake_n ?? 0}</div><div class="l">Intake</div></a>
+      <a class="stat" href="/print?status=proof"><div class="n">${pc?.proof_n ?? 0}</div><div class="l">Proof</div></a>
+      <a class="stat" href="/print/board"><div class="n">${pc?.press_n ?? 0}</div><div class="l">Approved / press</div></a>
+      <a class="stat" href="/print?status=ready"><div class="n">${pc?.ready_n ?? 0}</div><div class="l">Ready</div></a>
+    </div>
+
+    ${
+			overdueCount
+				? `<div class="dash-attn">
+      <h2>Overdue follow-ups (${overdueCount})</h2>
+      <table>
+        <thead><tr><th>Job</th><th>Customer</th><th>Stage</th><th>Follow-up</th></tr></thead>
+        <tbody>${overdueRows}</tbody>
+      </table>
+      <p style="margin:0.75rem 0 0"><a href="/leads">Open lead pipeline →</a></p>
+    </div>`
+				: `<p class="muted">No overdue lead follow-ups.</p>`
+		}
+
+    <h2>Today's schedule</h2>
     <table>
       <thead><tr><th>Job</th><th>Customer</th><th>Type</th><th>Status</th><th>When</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
+      <tbody>${todayRows}</tbody>
+    </table>
 
-	return c.html(page(c, "Home", body));
+    <h2>Up next</h2>
+    <table>
+      <thead><tr><th>Job</th><th>Customer</th><th>Type</th><th>Status</th><th>When</th></tr></thead>
+      <tbody>${upcomingRows}</tbody>
+    </table>
+
+    <h2>Products</h2>
+    <div class="product-grid">${productCards}</div>
+    <div class="toolbar">
+      <a class="btn" href="/jobs/new?product=restoration">New restoration job</a>
+      <a class="btn secondary" href="/jobs/new?product=floors">New floor job</a>
+      <a class="btn secondary" href="/print/new">New print job</a>
+    </div>`;
+
+	return c.html(page(c, "Dashboard", body));
 });
 
 app.get("/restoration", async (c) => {

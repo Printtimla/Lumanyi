@@ -115,6 +115,35 @@ a.product-card .btn {
 }
 .stat .n { font-size: 1.8rem; font-weight: 700; letter-spacing: -0.03em; }
 .stat .l { color: var(--muted); font-size: 0.9rem; }
+.grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+a.stat {
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 0.15s ease;
+}
+a.stat:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+.dash-attn {
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: var(--radius);
+  padding: 1rem;
+  margin: 1rem 0;
+}
+.dash-attn h2 { margin-top: 0; color: var(--warn); }
+.quick-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.85rem;
+  margin: 0.75rem 0 1.25rem;
+  font-size: 0.95rem;
+}
 
 .toolbar {
   display: flex;
