@@ -137,6 +137,18 @@ a.stat:hover {
   margin: 1rem 0;
 }
 .dash-attn h2 { margin-top: 0; color: var(--warn); }
+.dash-attn-ok {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+}
+.dash-attn-ok h2 { color: #15803d; }
+.bn-block { margin-top: 1rem; }
+.bn-block:first-of-type { margin-top: 0.35rem; }
+.bn-block h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+.bn-more { margin: 0.5rem 0 0; font-size: 0.9rem; }
 .quick-links {
   display: flex;
   flex-wrap: wrap;

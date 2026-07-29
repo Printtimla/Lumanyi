@@ -124,6 +124,11 @@ import {
 	type PrintJobAccess,
 } from "./lib/access";
 import {
+	loadBottleneckSections,
+	printBottleneckFilters,
+	renderBottleneckStrip,
+} from "./lib/bottlenecks";
+import {
 	canAccessTrash,
 	canSoftDelete,
 } from "./lib/soft-delete";
@@ -2306,36 +2311,25 @@ app.get("/", async (c) => {
 	const listFilter =
 		listWhere.length > 0 ? `AND ${listWhere.join(" AND ")}` : "";
 
-	const overdue = await (listBinds.length
-		? c.env.DB.prepare(
-				`SELECT j.id, j.title, j.follow_up_at, j.status, c.name AS customer_name
-         FROM jobs j
-         JOIN customers c ON c.id = j.customer_id
-         WHERE j.status IN ('lead','estimate')
-           AND j.follow_up_at IS NOT NULL
-           AND date(j.follow_up_at) < date(?)
-           ${listFilter}
-         ORDER BY j.follow_up_at ASC
-         LIMIT 8`,
-			).bind(today, ...listBinds)
-		: c.env.DB.prepare(
-				`SELECT j.id, j.title, j.follow_up_at, j.status, c.name AS customer_name
-         FROM jobs j
-         JOIN customers c ON c.id = j.customer_id
-         WHERE j.status IN ('lead','estimate')
-           AND j.follow_up_at IS NOT NULL
-           AND date(j.follow_up_at) < date(?)
-           ${listFilter}
-         ORDER BY j.follow_up_at ASC
-         LIMIT 8`,
-			).bind(today)
-	).all<{
-		id: string;
-		title: string;
-		follow_up_at: string;
-		status: string;
-		customer_name: string;
-	}>();
+	let bottleneckHtml = "";
+	if (office) {
+		const fieldFilters =
+			hasR || hasF
+				? {
+						whereSql: listWhere.join(" AND "),
+						binds: [...listBinds],
+					}
+				: null;
+		const printFilters = canAccessProduct(user, "print")
+			? printBottleneckFilters(printVis)
+			: null;
+		const sections = await loadBottleneckSections(c.env.DB, {
+			today,
+			field: fieldFilters,
+			print: printFilters,
+		});
+		bottleneckHtml = renderBottleneckStrip(sections);
+	}
 
 	const todayJobs = await (listBinds.length
 		? c.env.DB.prepare(
@@ -2399,18 +2393,6 @@ app.get("/", async (c) => {
 		customer_name: string;
 	}>();
 
-	const overdueRows =
-		overdue.results
-			?.map(
-				(j) => `<tr>
-        <td><a href="/jobs/${escapeHtml(j.id)}">${escapeHtml(j.title)}</a></td>
-        <td>${escapeHtml(j.customer_name)}</td>
-        <td><span class="badge ${escapeHtml(j.status)}">${escapeHtml(statusLabel(j.status))}</span></td>
-        <td style="color:var(--danger);font-weight:600">${escapeHtml(j.follow_up_at.slice(0, 10))}</td>
-      </tr>`,
-			)
-			.join("") || "";
-
 	const todayRows =
 		todayJobs.results
 			?.map(
@@ -2452,7 +2434,6 @@ app.get("/", async (c) => {
 
 	const fc = fieldCounts;
 	const pc = printCounts;
-	const overdueCount = office ? (overdue.results?.length ?? 0) : 0;
 
 	const quickLinks: string[] = [];
 	if (office) quickLinks.push(`<a href="/leads">Leads</a>`);
@@ -2490,19 +2471,6 @@ app.get("/", async (c) => {
     </div>`
 		: "";
 
-	const overdueBlock = office
-		? overdueCount
-			? `<div class="dash-attn">
-      <h2>Overdue follow-ups (${overdueCount})</h2>
-      <table>
-        <thead><tr><th>Job</th><th>Customer</th><th>Stage</th><th>Follow-up</th></tr></thead>
-        <tbody>${overdueRows}</tbody>
-      </table>
-      <p style="margin:0.75rem 0 0"><a href="/leads">Open lead pipeline →</a></p>
-    </div>`
-			: `<p class="muted">No overdue lead follow-ups.</p>`
-		: "";
-
 	const newJobBtns: string[] = [];
 	if (hasR && office) {
 		newJobBtns.push(
@@ -2526,9 +2494,9 @@ app.get("/", async (c) => {
       ${quickLinks.join("\n      ")}
     </div>
 
+    ${bottleneckHtml}
     ${fieldStats}
     ${printStats}
-    ${overdueBlock}
 
     <h2>Today's schedule</h2>
     <table>
