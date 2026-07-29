@@ -1,10 +1,14 @@
 -- MG-3.1: Invoices (field + print) with draft → approved → sent.
+-- No SQL FOREIGN KEYs: D1 has rejected FK creates on some accounts (SQLITE_CONSTRAINT_FOREIGNKEY).
+-- Integrity is enforced in app code (job/print job load + cascade deletes via app).
 
-CREATE TABLE invoices (
+PRAGMA foreign_keys = OFF;
+
+CREATE TABLE IF NOT EXISTS invoices (
   id TEXT PRIMARY KEY,
   source TEXT NOT NULL CHECK (source IN ('field', 'print')),
-  job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
-  print_job_id TEXT REFERENCES print_jobs(id) ON DELETE CASCADE,
+  job_id TEXT,
+  print_job_id TEXT,
   status TEXT NOT NULL DEFAULT 'draft'
     CHECK (status IN ('draft', 'approved', 'sent')),
   subtotal_cents INTEGER NOT NULL DEFAULT 0,
@@ -13,10 +17,10 @@ CREATE TABLE invoices (
   writeoff_cents INTEGER NOT NULL DEFAULT 0,
   total_cents INTEGER NOT NULL DEFAULT 0,
   notes TEXT,
-  created_by TEXT REFERENCES users(id),
-  approved_by TEXT REFERENCES users(id),
+  created_by TEXT,
+  approved_by TEXT,
   approved_at TEXT,
-  sent_by TEXT REFERENCES users(id),
+  sent_by TEXT,
   sent_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -26,9 +30,9 @@ CREATE TABLE invoices (
   )
 );
 
-CREATE TABLE invoice_lines (
+CREATE TABLE IF NOT EXISTS invoice_lines (
   id TEXT PRIMARY KEY,
-  invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  invoice_id TEXT NOT NULL,
   description TEXT NOT NULL,
   quantity REAL NOT NULL DEFAULT 1,
   unit TEXT NOT NULL DEFAULT 'ea',
@@ -36,7 +40,9 @@ CREATE TABLE invoice_lines (
   sort_order INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX idx_invoices_job ON invoices(job_id);
-CREATE INDEX idx_invoices_print_job ON invoices(print_job_id);
-CREATE INDEX idx_invoices_status ON invoices(status);
-CREATE INDEX idx_invoice_lines_invoice ON invoice_lines(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_job ON invoices(job_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_print_job ON invoices(print_job_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
+CREATE INDEX IF NOT EXISTS idx_invoice_lines_invoice ON invoice_lines(invoice_id);
+
+PRAGMA foreign_keys = ON;
