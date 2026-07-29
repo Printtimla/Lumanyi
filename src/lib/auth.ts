@@ -2,7 +2,7 @@ import type { Context } from "hono";
 import { setCookie, deleteCookie } from "hono/cookie";
 import { newId } from "./ids";
 import { hashPassword } from "./password";
-import type { PermissionRole } from "./roles";
+import { resolvePermissionRole, type PermissionRole } from "./roles";
 import type { ProductKey } from "./products";
 import { parseProducts } from "./access";
 
@@ -117,8 +117,10 @@ export async function getSessionUser(
 		return null;
 	}
 
-	const permissionRole: AppUser["role"] =
-		row.role === "owner" || row.role === "dispatcher" ? row.role : "tech";
+	const permissionRole: PermissionRole = resolvePermissionRole(
+		row.role,
+		row.designation || row.role,
+	);
 
 	return {
 		id: row.id,

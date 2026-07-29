@@ -58,12 +58,21 @@ export function canAccessProduct(user: AppUser, product: ProductKey): boolean {
 	return user.products.includes(product);
 }
 
+/** Owner / Manager / Dispatcher — full visibility within product scope. */
+export function isOfficeStaff(user: AppUser): boolean {
+	return (
+		user.role === "owner" ||
+		user.role === "manager" ||
+		user.role === "dispatcher"
+	);
+}
+
 export function canViewAllJobs(user: AppUser): boolean {
-	return user.role === "owner" || user.role === "dispatcher";
+	return isOfficeStaff(user);
 }
 
 export function canReopenJobs(user: AppUser): boolean {
-	return user.role === "owner" || user.role === "dispatcher";
+	return isOfficeStaff(user);
 }
 
 export function canManageUsers(user: AppUser): boolean {
@@ -72,7 +81,7 @@ export function canManageUsers(user: AppUser): boolean {
 
 /** Office nav: customers, leads, reports, recurring. */
 export function canSeeOfficeTools(user: AppUser): boolean {
-	return user.role === "owner" || user.role === "dispatcher";
+	return isOfficeStaff(user);
 }
 
 export function isStatusLocked(status: string): boolean {

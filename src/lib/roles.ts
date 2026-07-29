@@ -6,13 +6,14 @@ import { ALL_PRODUCTS } from "./access";
 /** Login / permission roles (DB CHECK on users.role). */
 export const PERMISSION_ROLES = [
 	{ value: "owner", label: "Owner" },
+	{ value: "manager", label: "Manager" },
 	{ value: "dispatcher", label: "Dispatcher" },
 	{ value: "tech", label: "Tech" },
 ] as const;
 
 /**
  * Designations shown in Users admin + Assigned to.
- * Management maps to dispatcher permission until a real manager role ships.
+ * Management maps to the real manager permission role (MG-0).
  */
 export const USER_ROLES = [
 	{ value: "owner", label: "Super Admin / Owner" },
@@ -64,14 +65,30 @@ export function isKnownDesignation(role: string): role is AnyDesignation {
 	return ALL_LABELS.some((r) => r.value === role);
 }
 
+/**
+ * Resolve AppUser.role from DB role + designation.
+ * Prefers role column after MG-0; designation=manager still elevates
+ * rows that were stored as dispatcher before migration 0030.
+ */
+export function resolvePermissionRole(
+	dbRole: string,
+	designation: string,
+): PermissionRole {
+	if (dbRole === "owner" || designation === "owner") return "owner";
+	if (dbRole === "manager" || designation === "manager") return "manager";
+	if (dbRole === "dispatcher" || designation === "dispatcher") {
+		return "dispatcher";
+	}
+	return "tech";
+}
+
 /** Map designation → permission role stored in users.role. */
 export function permissionRoleFor(
 	designation: string,
 ): PermissionRole {
 	if (designation === "owner") return "owner";
-	if (designation === "manager" || designation === "dispatcher") {
-		return "dispatcher";
-	}
+	if (designation === "manager") return "manager";
+	if (designation === "dispatcher") return "dispatcher";
 	return "tech"; // all tech lanes + legacy lead_tech / tech
 }
 

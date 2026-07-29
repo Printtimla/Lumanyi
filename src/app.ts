@@ -5676,7 +5676,7 @@ app.post("/inventory/:id", async (c) => {
 });
 
 app.get("/reports", async (c) => {
-	if (!canSeeOfficeTools(c.get("user")!)) return c.html(forbiddenHtml(c, "Reports are for owner / dispatcher."), 403);
+	if (!canSeeOfficeTools(c.get("user")!)) return c.html(forbiddenHtml(c, "Reports are for owner / manager / dispatcher."), 403);
 	const from = c.req.query("from") || "";
 	const to = c.req.query("to") || "";
 	const q = new URLSearchParams();
@@ -6384,7 +6384,7 @@ app.get("/print/board", async (c) => {
 
 app.get("/print/new", async (c) => {
 	if (!canAccessProduct(c.get("user")!, "print")) return c.html(forbiddenHtml(c, "Your account does not include Print Ops."), 403);
-	if (!canSeeOfficeTools(c.get("user")!)) return c.html(forbiddenHtml(c, "Creating print jobs is for owner / dispatcher."), 403);
+	if (!canSeeOfficeTools(c.get("user")!)) return c.html(forbiddenHtml(c, "Creating print jobs is for owner / manager / dispatcher."), 403);
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();

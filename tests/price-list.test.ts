@@ -23,6 +23,7 @@ function user(role: AppUser["role"]): AppUser {
 describe("SA-6.1 price lists", () => {
 	it("only owner manages price lists", () => {
 		expect(canManagePriceLists(user("owner"))).toBe(true);
+		expect(canManagePriceLists(user("manager"))).toBe(false);
 		expect(canManagePriceLists(user("dispatcher"))).toBe(false);
 		expect(canManagePriceLists(user("tech"))).toBe(false);
 	});

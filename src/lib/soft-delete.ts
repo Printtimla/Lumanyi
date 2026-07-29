@@ -9,7 +9,11 @@ export function canAccessTrash(user: AppUser): boolean {
 
 /** Office staff may archive (soft-delete); techs may not. */
 export function canSoftDelete(user: AppUser): boolean {
-	return user.role === "owner" || user.role === "dispatcher";
+	return (
+		user.role === "owner" ||
+		user.role === "manager" ||
+		user.role === "dispatcher"
+	);
 }
 
 export const NOT_DELETED_SQL = "deleted_at IS NULL";

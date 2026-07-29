@@ -93,6 +93,15 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] SA-6.3: Owner internal labor rates by designation + job-cost prefill (not payroll)
 - [x] SA-6.4: Owner discount / write-off caps (rules + notices; enforce when discount UI exists)
 
+## Management spine (MG)
+
+- [x] MG-0: Real `manager` permission role (widen users.role CHECK); Management → manager; product-scoped full visibility; Owner-only Users/Trash/Audit/financial settings unchanged
+- [ ] MG-1: Manager dashboard + bottleneck alerts from existing data
+- [ ] MG-2: Reassign / reopen overrides
+- [ ] MG-3: Draft invoice + approve/send PDF; enforce SA-6.4 caps
+- [ ] MG-4: Manager-driven scheduling + tech schedule-change request (no GPS yet)
+- [ ] MG-5: Tech price blindness hardening
+
 ## Phase 6 — Multi-brand
 
 - [ ] Separate domains / branding per product — **deferred**

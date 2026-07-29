@@ -18,12 +18,14 @@ function user(role: AppUser["role"]): AppUser {
 describe("SA-2 soft delete access", () => {
 	it("only owner opens trash", () => {
 		expect(canAccessTrash(user("owner"))).toBe(true);
+		expect(canAccessTrash(user("manager"))).toBe(false);
 		expect(canAccessTrash(user("dispatcher"))).toBe(false);
 		expect(canAccessTrash(user("tech"))).toBe(false);
 	});
 
-	it("owner and dispatcher may archive", () => {
+	it("owner, manager, and dispatcher may archive", () => {
 		expect(canSoftDelete(user("owner"))).toBe(true);
+		expect(canSoftDelete(user("manager"))).toBe(true);
 		expect(canSoftDelete(user("dispatcher"))).toBe(true);
 		expect(canSoftDelete(user("tech"))).toBe(false);
 	});

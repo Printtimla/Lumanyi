@@ -22,6 +22,7 @@ function user(role: AppUser["role"]): AppUser {
 describe("SA-3 void claim data", () => {
 	it("field roles may void", () => {
 		expect(canVoidClaimData(user("owner"))).toBe(true);
+		expect(canVoidClaimData(user("manager"))).toBe(true);
 		expect(canVoidClaimData(user("dispatcher"))).toBe(true);
 		expect(canVoidClaimData(user("tech"))).toBe(true);
 	});

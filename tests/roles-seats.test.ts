@@ -3,6 +3,7 @@ import {
 	defaultProductsForDesignation,
 	LEAST_PRIVILEGE_DESIGNATION,
 	permissionRoleFor,
+	resolvePermissionRole,
 	roleLabel,
 	seatLimitForDesignation,
 	SUPER_ADMIN_SEAT_LIMIT,
@@ -26,8 +27,9 @@ describe("SA-1 designation mapping", () => {
 		expect(roleLabel("owner")).toBe("Super Admin / Owner");
 	});
 
-	it("maps management to dispatcher permission until real manager ships", () => {
-		expect(permissionRoleFor("manager")).toBe("dispatcher");
+	it("maps management to manager permission (MG-0)", () => {
+		expect(permissionRoleFor("manager")).toBe("manager");
+		expect(permissionRoleFor("dispatcher")).toBe("dispatcher");
 	});
 
 	it("defaults least privilege to mitigation tech + restoration", () => {
@@ -41,5 +43,13 @@ describe("SA-1 designation mapping", () => {
 	it("keeps legacy lead_tech as tech permission", () => {
 		expect(permissionRoleFor("lead_tech")).toBe("tech");
 		expect(roleLabel("lead_tech")).toContain("Lead Tech");
+	});
+
+	it("elevates designation=manager even when DB role is still dispatcher", () => {
+		expect(resolvePermissionRole("dispatcher", "manager")).toBe("manager");
+		expect(resolvePermissionRole("manager", "manager")).toBe("manager");
+		expect(resolvePermissionRole("dispatcher", "dispatcher")).toBe(
+			"dispatcher",
+		);
 	});
 });

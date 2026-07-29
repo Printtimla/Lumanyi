@@ -9,6 +9,7 @@ export const NOT_VOIDED_L = "l.voided_at IS NULL";
 export function canVoidClaimData(user: AppUser): boolean {
 	return (
 		user.role === "owner" ||
+		user.role === "manager" ||
 		user.role === "dispatcher" ||
 		user.role === "tech"
 	);

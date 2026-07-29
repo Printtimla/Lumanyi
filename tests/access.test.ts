@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
 	canAccessProduct,
+	canManageUsers,
 	canReadFieldJob,
+	canSeeOfficeTools,
+	canViewAllJobs,
 	canWriteFieldJob,
 	parseProducts,
 	serializeProducts,
@@ -98,5 +101,30 @@ describe("field job access", () => {
 		});
 		expect(canAccessProduct(tech, "restoration")).toBe(false);
 		expect(canReadFieldJob(tech, job)).toBe(false);
+	});
+
+	it("lets manager view all jobs in product scope but not Owner governance", () => {
+		const manager = user({
+			role: "manager",
+			designation: "manager",
+			products: ["restoration"],
+		});
+		expect(canViewAllJobs(manager)).toBe(true);
+		expect(canSeeOfficeTools(manager)).toBe(true);
+		expect(canManageUsers(manager)).toBe(false);
+		expect(canReadFieldJob(manager, job)).toBe(true);
+		expect(canWriteFieldJob(manager, job)).toBe(true);
+		expect(
+			canReadFieldJob(manager, { ...job, assigned_user_id: "other" }),
+		).toBe(true);
+		expect(
+			canAccessProduct(
+				user({ role: "manager", products: ["print"] }),
+				"restoration",
+			),
+		).toBe(false);
+		expect(
+			canReadFieldJob(user({ role: "manager", products: ["print"] }), job),
+		).toBe(false);
 	});
 });
