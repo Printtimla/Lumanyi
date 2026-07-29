@@ -21,7 +21,11 @@ export type AuditAction =
 	| "labor_rate_update"
 	| "discount_cap_update"
 	| "job_reopen"
-	| "job_reassign";
+	| "job_reassign"
+	| "invoice_create"
+	| "invoice_update"
+	| "invoice_approve"
+	| "invoice_send";
 
 export type AuditEntityType =
 	| "customer"
@@ -34,7 +38,8 @@ export type AuditEntityType =
 	| "price_list_item"
 	| "print_margin_settings"
 	| "labor_rate"
-	| "discount_cap_settings";
+	| "discount_cap_settings"
+	| "invoice";
 
 export type AuditEventInput = {
 	actorUserId: string | null;

@@ -98,7 +98,10 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 - [x] MG-0: Real `manager` permission role (widen users.role CHECK); Management → manager; product-scoped full visibility; Owner-only Users/Trash/Audit/financial settings unchanged
 - [x] MG-1: Manager dashboard + bottleneck alerts from existing data
 - [x] MG-2: Reassign / reopen overrides
-- [ ] MG-3: Draft invoice + approve/send PDF; enforce SA-6.4 caps
+- [x] MG-3.1: Field + print invoices (draft → approve → send), PDF, SA-6.4 caps enforced + audit
+- [ ] MG-3.2: Email delivery of approved invoice PDF (needs email provider + API key)
+- [ ] MG-3.3: A/R ledger (balances, record payment, aging)
+- [ ] MG-3.4: ACH collect via Stripe (or similar) + webhook → ledger paid
 - [ ] MG-4: Manager-driven scheduling + tech schedule-change request (no GPS yet)
 - [ ] MG-5: Tech price blindness hardening
 

@@ -122,5 +122,5 @@ export function summarizeDiscountCaps(settings: DiscountCapSettings): string {
 }
 
 export function discountCapNoticeHtml(settings: DiscountCapSettings): string {
-	return `Discount / write-off policy (rules only — discount UI not built yet): ${summarizeDiscountCaps(settings)}.`;
+	return `Discount / write-off policy (enforced on invoices): ${summarizeDiscountCaps(settings)}.`;
 }

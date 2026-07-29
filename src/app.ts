@@ -23,6 +23,20 @@ import {
 import { newId } from "./lib/ids";
 import { hashPassword, verifyPassword } from "./lib/password";
 import { generateDueRecurringJobs } from "./lib/recurring";
+import {
+	approveInvoice,
+	buildInvoicePdf,
+	canManageInvoices,
+	createFieldInvoiceFromEstimate,
+	createPrintInvoiceFromQuote,
+	getLatestInvoiceForJob,
+	getLatestInvoiceForPrintJob,
+	listInvoiceLines,
+	parseInvoiceDiscountForm,
+	renderInvoiceWorkspaceHtml,
+	sendInvoice,
+	updateInvoiceDraft,
+} from "./lib/invoice";
 import { buildEstimatePdf, syncJobEstimateTotal } from "./lib/estimate";
 import {
 	PRINT_BOARD_COLUMNS,
@@ -2170,8 +2184,8 @@ app.get("/settings/discount-caps", async (c) => {
 	const body = `
     <p><a href="/settings/labor-rates">← Labor rates</a> · <a href="/settings/price-lists">Price lists</a></p>
     <h1>Discount / write-off caps</h1>
-    <p class="muted">Owner policy for future discount &amp; write-off UI. <strong>Not enforced yet</strong> — no discount apply path exists.
-      These numbers are shown on estimates and print quotes so staff know the rules when that UI ships.</p>
+    <p class="muted">Owner policy for invoice discounts &amp; write-offs. <strong>Enforced</strong> on invoice save / approve / send (MG-3.1).
+      Hard max blocks everyone; Owner-approval threshold blocks non-Owners on approve/send.</p>
     <p class="muted">Current: ${escapeHtml(summarizeDiscountCaps(settings))}</p>
     <form method="post" action="/settings/discount-caps" class="panel stack">
       <div class="row">
@@ -2184,7 +2198,7 @@ app.get("/settings/discount-caps", async (c) => {
         <div><label for="owner_approval_pct">Owner approval at ≥ %</label>
           <input id="owner_approval_pct" name="owner_approval_pct" type="number" step="0.1" min="0" max="100"
             required value="${escapeHtml(settings.owner_approval_pct)}"
-            title="Discounts at or above this % will require Owner approval when discount UI ships" /></div>
+            title="Discounts at or above this % require Owner approval on invoice approve/send" /></div>
       </div>
       <p class="muted" style="margin:0;font-size:0.85rem">Use 0 to mean “unset / not limited” for that field until you choose a real cap.</p>
       <button class="btn" type="submit">Save discount caps</button>
@@ -4250,6 +4264,7 @@ app.get("/jobs/:id", async (c) => {
       </div>
       <a class="btn secondary" href="/jobs/${escapeHtml(id)}/estimate">Estimate</a>
       <a class="btn secondary" href="/jobs/${escapeHtml(id)}/estimate.pdf">PDF</a>
+      ${canManageInvoices(user) ? `<a class="btn secondary" href="/jobs/${escapeHtml(id)}/invoice">Invoice</a>` : ""}
       ${isRestoration ? `<a class="btn secondary" href="/jobs/${escapeHtml(id)}/water-loss.pdf">Water-loss PDF</a>` : ""}
       ${
 				isArchived && canAccessTrash(user)
@@ -5101,6 +5116,185 @@ app.get("/jobs/:id/estimate.pdf", async (c) => {
 		headers: {
 			"Content-Type": "application/pdf",
 			"Content-Disposition": `attachment; filename="estimate-${id}.pdf"`,
+		},
+	});
+});
+
+app.get("/jobs/:id/invoice", async (c) => {
+	const user = c.get("user")!;
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.job_type, c.name AS customer_name
+     FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.id = ?`,
+	)
+		.bind(id)
+		.first<{ id: string; title: string; job_type: string; customer_name: string }>();
+	if (!job) return c.notFound();
+	if (!canAccessProduct(user, productForJobType(job.job_type))) {
+		return c.text("Forbidden", 403);
+	}
+	const invoice = await getLatestInvoiceForJob(c.env.DB, id);
+	const lines = invoice ? await listInvoiceLines(c.env.DB, invoice.id) : [];
+	const caps = await getDiscountCapSettings(c.env.DB);
+	const flash = c.req.query("err") || null;
+	const body = renderInvoiceWorkspaceHtml({
+		backHref: `/jobs/${id}`,
+		backLabel: "← Job",
+		actionBase: `/jobs/${id}/invoice`,
+		pdfHref: `/jobs/${id}/invoice.pdf`,
+		jobTitle: job.title,
+		customerName: job.customer_name,
+		invoice,
+		lines,
+		capNotice: discountCapNoticeHtml(caps),
+		flash,
+		canManage: canManageInvoices(user),
+	});
+	return c.html(page(c, "Invoice", body));
+});
+
+app.post("/jobs/:id/invoice/create", async (c) => {
+	const user = c.get("user")!;
+	if (!canManageInvoices(user)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const job = await loadFieldJobAccess(c.env.DB, id);
+	if (!job || job.deleted_at) return c.notFound();
+	if (!canAccessProduct(user, productForJobType(job.job_type))) {
+		return c.text("Forbidden", 403);
+	}
+	const inv = await createFieldInvoiceFromEstimate(c.env.DB, id, user.id);
+	await recordAudit(c, {
+		action: "invoice_create",
+		entityType: "invoice",
+		entityId: inv.id,
+		summary: `Created field invoice draft for job ${id}`,
+		detail: { jobId: id, total_cents: inv.total_cents },
+	});
+	return c.redirect(`/jobs/${id}/invoice`);
+});
+
+app.post("/jobs/:id/invoice", async (c) => {
+	const user = c.get("user")!;
+	if (!canManageInvoices(user)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const invoice = await getLatestInvoiceForJob(c.env.DB, id);
+	if (!invoice || invoice.job_id !== id) return c.notFound();
+	const form = await c.req.parseBody();
+	const parsed = parseInvoiceDiscountForm(form as Record<string, unknown>);
+	if (!parsed.ok) return c.redirect(`/jobs/${id}/invoice?err=${encodeURIComponent(parsed.error)}`);
+	const result = await updateInvoiceDraft(c.env.DB, invoice, {
+		user,
+		discountPct: parsed.discountPct,
+		writeoffCents: parsed.writeoffCents,
+		notes: parsed.notes,
+	});
+	if (!result.ok) {
+		return c.redirect(`/jobs/${id}/invoice?err=${encodeURIComponent(result.error)}`);
+	}
+	await recordAudit(c, {
+		action: "invoice_update",
+		entityType: "invoice",
+		entityId: invoice.id,
+		summary: `Updated field invoice draft ${invoice.id}`,
+		detail: {
+			discount_pct: parsed.discountPct,
+			writeoff_cents: parsed.writeoffCents,
+			total_cents: result.invoice.total_cents,
+		},
+	});
+	return c.redirect(`/jobs/${id}/invoice`);
+});
+
+app.post("/jobs/:id/invoice/approve", async (c) => {
+	const user = c.get("user")!;
+	if (!canManageInvoices(user)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const invoice = await getLatestInvoiceForJob(c.env.DB, id);
+	if (!invoice || invoice.job_id !== id) return c.notFound();
+	const result = await approveInvoice(c.env.DB, invoice, user);
+	if (!result.ok) {
+		return c.redirect(`/jobs/${id}/invoice?err=${encodeURIComponent(result.error)}`);
+	}
+	await recordAudit(c, {
+		action: "invoice_approve",
+		entityType: "invoice",
+		entityId: invoice.id,
+		summary: `Approved field invoice ${invoice.id}`,
+		detail: { total_cents: result.invoice.total_cents },
+	});
+	return c.redirect(`/jobs/${id}/invoice`);
+});
+
+app.post("/jobs/:id/invoice/send", async (c) => {
+	const user = c.get("user")!;
+	if (!canManageInvoices(user)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const invoice = await getLatestInvoiceForJob(c.env.DB, id);
+	if (!invoice || invoice.job_id !== id) return c.notFound();
+	const result = await sendInvoice(c.env.DB, invoice, user);
+	if (!result.ok) {
+		return c.redirect(`/jobs/${id}/invoice?err=${encodeURIComponent(result.error)}`);
+	}
+	await recordAudit(c, {
+		action: "invoice_send",
+		entityType: "invoice",
+		entityId: invoice.id,
+		summary: `Sent field invoice ${invoice.id}`,
+		detail: { total_cents: result.invoice.total_cents, job_status: "invoiced" },
+	});
+	return c.redirect(`/jobs/${id}/invoice`);
+});
+
+app.get("/jobs/:id/invoice.pdf", async (c) => {
+	const user = c.get("user")!;
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT j.id, j.title, j.job_type, c.name AS customer_name,
+      s.address_line1, s.city, s.state, s.postal_code
+     FROM jobs j
+     JOIN customers c ON c.id = j.customer_id
+     LEFT JOIN sites s ON s.id = j.site_id
+     WHERE j.id = ?`,
+	)
+		.bind(id)
+		.first<{
+			id: string;
+			title: string;
+			job_type: string;
+			customer_name: string;
+			address_line1: string | null;
+			city: string | null;
+			state: string | null;
+			postal_code: string | null;
+		}>();
+	if (!job) return c.notFound();
+	if (!canAccessProduct(user, productForJobType(job.job_type))) {
+		return c.text("Forbidden", 403);
+	}
+	const invoice = await getLatestInvoiceForJob(c.env.DB, id);
+	if (!invoice) return c.text("No invoice yet", 404);
+	const lines = await listInvoiceLines(c.env.DB, invoice.id);
+	const siteLine = job.address_line1
+		? `${job.address_line1}, ${job.city}, ${job.state} ${job.postal_code || ""}`.trim()
+		: "";
+	const bytes = await buildInvoicePdf({
+		title: job.title,
+		customerName: job.customer_name,
+		siteLine,
+		invoiceId: invoice.id,
+		status: invoice.status,
+		lines,
+		subtotalCents: invoice.subtotal_cents,
+		discountPct: invoice.discount_pct,
+		discountCents: invoice.discount_cents,
+		writeoffCents: invoice.writeoff_cents,
+		totalCents: invoice.total_cents,
+		notes: invoice.notes,
+	});
+	return new Response(bytes, {
+		headers: {
+			"Content-Type": "application/pdf",
+			"Content-Disposition": `attachment; filename="invoice-${invoice.id}.pdf"`,
 		},
 	});
 });
@@ -6763,6 +6957,7 @@ app.get("/print/:id", async (c) => {
       </div>
       <a class="btn secondary" href="/print/board">Press board</a>
       <a class="btn secondary" href="/print">All print jobs</a>
+      ${canManageInvoices(user) ? `<a class="btn secondary" href="/print/${escapeHtml(id)}/invoice">Invoice</a>` : ""}
       ${
 				isArchived && canAccessTrash(user)
 					? `<form method="post" action="/trash/print/${escapeHtml(id)}/restore" class="inline"><button class="btn" type="submit">Restore</button></form>`
@@ -6974,6 +7169,184 @@ app.post("/print/:id/reassign", async (c) => {
 		},
 	});
 	return c.redirect(`/print/${id}`);
+});
+
+app.get("/print/:id/invoice", async (c) => {
+	const user = c.get("user")!;
+	if (!canAccessProduct(user, "print")) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT p.id, p.title, c.name AS customer_name
+     FROM print_jobs p
+     LEFT JOIN customers c ON c.id = p.customer_id
+     WHERE p.id = ?`,
+	)
+		.bind(id)
+		.first<{ id: string; title: string; customer_name: string | null }>();
+	if (!job) return c.notFound();
+	const invoice = await getLatestInvoiceForPrintJob(c.env.DB, id);
+	const lines = invoice ? await listInvoiceLines(c.env.DB, invoice.id) : [];
+	const caps = await getDiscountCapSettings(c.env.DB);
+	const flash = c.req.query("err") || null;
+	const body = renderInvoiceWorkspaceHtml({
+		backHref: `/print/${id}`,
+		backLabel: "← Print job",
+		actionBase: `/print/${id}/invoice`,
+		pdfHref: `/print/${id}/invoice.pdf`,
+		jobTitle: job.title,
+		customerName: job.customer_name || "Walk-in / TBD",
+		invoice,
+		lines,
+		capNotice: discountCapNoticeHtml(caps),
+		flash,
+		canManage: canManageInvoices(user),
+	});
+	return c.html(page(c, "Invoice", body));
+});
+
+app.post("/print/:id/invoice/create", async (c) => {
+	const user = c.get("user")!;
+	if (!canManageInvoices(user) || !canAccessProduct(user, "print")) {
+		return c.text("Forbidden", 403);
+	}
+	const id = c.req.param("id");
+	const job = await loadPrintJobAccess(c.env.DB, id);
+	if (!job || job.deleted_at) return c.notFound();
+	const inv = await createPrintInvoiceFromQuote(c.env.DB, id, user.id);
+	await recordAudit(c, {
+		action: "invoice_create",
+		entityType: "invoice",
+		entityId: inv.id,
+		summary: `Created print invoice draft for job ${id}`,
+		detail: { printJobId: id, total_cents: inv.total_cents },
+	});
+	return c.redirect(`/print/${id}/invoice`);
+});
+
+app.post("/print/:id/invoice", async (c) => {
+	const user = c.get("user")!;
+	if (!canManageInvoices(user) || !canAccessProduct(user, "print")) {
+		return c.text("Forbidden", 403);
+	}
+	const id = c.req.param("id");
+	const invoice = await getLatestInvoiceForPrintJob(c.env.DB, id);
+	if (!invoice || invoice.print_job_id !== id) return c.notFound();
+	const form = await c.req.parseBody();
+	const parsed = parseInvoiceDiscountForm(form as Record<string, unknown>);
+	if (!parsed.ok) {
+		return c.redirect(
+			`/print/${id}/invoice?err=${encodeURIComponent(parsed.error)}`,
+		);
+	}
+	const result = await updateInvoiceDraft(c.env.DB, invoice, {
+		user,
+		discountPct: parsed.discountPct,
+		writeoffCents: parsed.writeoffCents,
+		notes: parsed.notes,
+	});
+	if (!result.ok) {
+		return c.redirect(
+			`/print/${id}/invoice?err=${encodeURIComponent(result.error)}`,
+		);
+	}
+	await recordAudit(c, {
+		action: "invoice_update",
+		entityType: "invoice",
+		entityId: invoice.id,
+		summary: `Updated print invoice draft ${invoice.id}`,
+		detail: {
+			discount_pct: parsed.discountPct,
+			writeoff_cents: parsed.writeoffCents,
+			total_cents: result.invoice.total_cents,
+		},
+	});
+	return c.redirect(`/print/${id}/invoice`);
+});
+
+app.post("/print/:id/invoice/approve", async (c) => {
+	const user = c.get("user")!;
+	if (!canManageInvoices(user) || !canAccessProduct(user, "print")) {
+		return c.text("Forbidden", 403);
+	}
+	const id = c.req.param("id");
+	const invoice = await getLatestInvoiceForPrintJob(c.env.DB, id);
+	if (!invoice || invoice.print_job_id !== id) return c.notFound();
+	const result = await approveInvoice(c.env.DB, invoice, user);
+	if (!result.ok) {
+		return c.redirect(
+			`/print/${id}/invoice?err=${encodeURIComponent(result.error)}`,
+		);
+	}
+	await recordAudit(c, {
+		action: "invoice_approve",
+		entityType: "invoice",
+		entityId: invoice.id,
+		summary: `Approved print invoice ${invoice.id}`,
+		detail: { total_cents: result.invoice.total_cents },
+	});
+	return c.redirect(`/print/${id}/invoice`);
+});
+
+app.post("/print/:id/invoice/send", async (c) => {
+	const user = c.get("user")!;
+	if (!canManageInvoices(user) || !canAccessProduct(user, "print")) {
+		return c.text("Forbidden", 403);
+	}
+	const id = c.req.param("id");
+	const invoice = await getLatestInvoiceForPrintJob(c.env.DB, id);
+	if (!invoice || invoice.print_job_id !== id) return c.notFound();
+	const result = await sendInvoice(c.env.DB, invoice, user);
+	if (!result.ok) {
+		return c.redirect(
+			`/print/${id}/invoice?err=${encodeURIComponent(result.error)}`,
+		);
+	}
+	await recordAudit(c, {
+		action: "invoice_send",
+		entityType: "invoice",
+		entityId: invoice.id,
+		summary: `Sent print invoice ${invoice.id}`,
+		detail: { total_cents: result.invoice.total_cents },
+	});
+	return c.redirect(`/print/${id}/invoice`);
+});
+
+app.get("/print/:id/invoice.pdf", async (c) => {
+	const user = c.get("user")!;
+	if (!canAccessProduct(user, "print")) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const job = await c.env.DB.prepare(
+		`SELECT p.id, p.title, c.name AS customer_name
+     FROM print_jobs p
+     LEFT JOIN customers c ON c.id = p.customer_id
+     WHERE p.id = ?`,
+	)
+		.bind(id)
+		.first<{ id: string; title: string; customer_name: string | null }>();
+	if (!job) return c.notFound();
+	const invoice = await getLatestInvoiceForPrintJob(c.env.DB, id);
+	if (!invoice) return c.text("No invoice yet", 404);
+	const lines = await listInvoiceLines(c.env.DB, invoice.id);
+	const bytes = await buildInvoicePdf({
+		title: job.title,
+		customerName: job.customer_name || "Walk-in / TBD",
+		siteLine: "Print Ops",
+		invoiceId: invoice.id,
+		status: invoice.status,
+		lines,
+		subtotalCents: invoice.subtotal_cents,
+		discountPct: invoice.discount_pct,
+		discountCents: invoice.discount_cents,
+		writeoffCents: invoice.writeoff_cents,
+		totalCents: invoice.total_cents,
+		notes: invoice.notes,
+	});
+	return new Response(bytes, {
+		headers: {
+			"Content-Type": "application/pdf",
+			"Content-Disposition": `attachment; filename="invoice-${invoice.id}.pdf"`,
+		},
+	});
 });
 
 app.post("/print/:id", async (c) => {
