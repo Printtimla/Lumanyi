@@ -97,7 +97,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 
 - [x] MG-0: Real `manager` permission role (widen users.role CHECK); Management → manager; product-scoped full visibility; Owner-only Users/Trash/Audit/financial settings unchanged
 - [x] MG-1: Manager dashboard + bottleneck alerts from existing data
-- [ ] MG-2: Reassign / reopen overrides
+- [x] MG-2: Reassign / reopen overrides
 - [ ] MG-3: Draft invoice + approve/send PDF; enforce SA-6.4 caps
 - [ ] MG-4: Manager-driven scheduling + tech schedule-change request (no GPS yet)
 - [ ] MG-5: Tech price blindness hardening

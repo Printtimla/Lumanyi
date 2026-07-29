@@ -149,6 +149,16 @@ a.stat:hover {
   font-size: 1rem;
 }
 .bn-more { margin: 0.5rem 0 0; font-size: 0.9rem; }
+.override-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  margin: 1rem 0;
+}
+.override-panel {
+  border-color: #fed7aa;
+  background: #fffbeb;
+}
 .quick-links {
   display: flex;
   flex-wrap: wrap;

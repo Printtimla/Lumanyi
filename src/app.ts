@@ -102,15 +102,27 @@ import {
 } from "./lib/job-costs";
 import { buildWaterLossPdf, parseOptionalNumber } from "./lib/water-loss";
 import {
+	canOverrideJobAssignment,
+	canReopenFieldStatus,
+	canReopenPrintStatus,
+	FIELD_REOPEN_STATUS,
+	normalizeOverrideReason,
+	officeLockBannerCopy,
+	PRINT_REOPEN_STATUS,
+	renderJobOverridePanels,
+} from "./lib/job-overrides";
+import {
 	ALL_PRODUCTS,
 	appendFieldJobListFilters,
 	canAccessProduct,
 	canManageUsers,
 	canReadFieldJob,
 	canReadPrintJob,
+	canReopenJobs,
 	canSeeOfficeTools,
 	canWriteFieldJob,
 	canWritePrintJob,
+	isPrintStatusLocked,
 	isStatusLocked,
 	jobTypeAllowedForUser,
 	fieldJobVisibility,
@@ -444,7 +456,7 @@ async function enforceFieldJobRoute(
 				archived
 					? "This job is in the Owner trash. Restore it from Trash to edit."
 					: locked
-						? "This job is locked (complete / invoiced). Owner or dispatcher can reopen it."
+						? "This job is locked (complete / invoiced). Owner / Manager / Dispatch can reopen it."
 						: "You can only edit field jobs assigned to you.",
 			),
 			403,
@@ -492,7 +504,7 @@ async function enforcePrintJobRoute(
 				c,
 				job.deleted_at
 					? "This print job is in the Owner trash. Restore it from Trash to edit."
-					: "This print job is locked or not assigned to you. Owner or dispatcher can reopen delivered jobs.",
+					: "This print job is locked or not assigned to you. Owner / Manager / Dispatch can reopen delivered jobs.",
 			),
 			403,
 		);
@@ -3708,20 +3720,26 @@ app.get("/jobs/:id", async (c) => {
 		job_type: job.job_type,
 	};
 	const canWrite = canWriteFieldJob(user, accessJob);
+	const canOverride = canOverrideJobAssignment(user);
 	const isArchived = !!accessJob.deleted_at;
 	const lockedBanner = isArchived
 		? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This job is archived (soft-deleted). Restore it from Trash to edit.</div>`
 		: !canWrite
 			? isStatusLocked(job.status)
-				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This job is locked (complete / invoiced). Field edits are disabled for techs. Owner or dispatcher can change status to reopen.</div>`
+				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">${escapeHtml(officeLockBannerCopy("field"))}</div>`
 				: `<div class="flash">Read-only — you can view this job but not edit it.</div>`
 			: isStatusLocked(job.status)
-				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">Job is complete / invoiced. Change status below to reopen before field edits by techs.</div>`
+				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">Job is complete / invoiced. Use <strong>Reopen</strong> below to unlock tech edits (or change status in Update).</div>`
 				: "";
 
+	const jobProduct = productForJobType(job.job_type);
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
-	).all<{ id: string; name: string; role: string }>();
+		`SELECT id, name, COALESCE(designation, role) AS role, products FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string; role: string; products: string | null }>();
+	const staffForLane =
+		staff.results?.filter((u) =>
+			parseProducts(u.products).includes(jobProduct),
+		) ?? [];
 
 	const checklist = await c.env.DB.prepare(
 		`SELECT id, label, done FROM job_checklist_items WHERE job_id = ? ORDER BY sort_order`,
@@ -4193,12 +4211,22 @@ app.get("/jobs/:id", async (c) => {
 		.join("");
 
 	const staffOptions =
-		staff.results
-			?.map(
+		staffForLane
+			.map(
 				(u) =>
 					`<option value="${escapeHtml(u.id)}" ${job.assigned_user_id === u.id ? "selected" : ""}>${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
 			)
 			.join("") || "";
+
+	const overridePanels = renderJobOverridePanels({
+		kind: "field",
+		jobId: id,
+		status: job.status,
+		assignedUserId: job.assigned_user_id,
+		staffOptionsHtml: staffOptions,
+		canOverride,
+		archived: isArchived,
+	});
 
 	const leadSourceOptions = [
 		`<option value="">—</option>`,
@@ -4210,6 +4238,7 @@ app.get("/jobs/:id", async (c) => {
 
 	const body = `
     ${lockedBanner}
+    ${overridePanels}
     <div class="toolbar">
       <div class="grow">
         <h1 style="margin:0">${escapeHtml(job.title)}</h1>
@@ -4348,6 +4377,87 @@ app.get("/jobs/:id", async (c) => {
     <div class="stack">${photoItems}</div>`;
 
 	return c.html(page(c, job.title, body));
+});
+
+app.post("/jobs/:id/reopen", async (c) => {
+	const user = c.get("user")!;
+	if (!canReopenJobs(user)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const job = await loadFieldJobAccess(c.env.DB, id);
+	if (!job) return c.notFound();
+	if (job.deleted_at) return c.text("Restore from Trash first.", 400);
+	if (!canReopenFieldStatus(job.status)) {
+		return c.text("Job is not locked (complete / invoiced).", 400);
+	}
+	if (!canAccessProduct(user, productForJobType(job.job_type))) {
+		return c.text("Forbidden", 403);
+	}
+	const form = await c.req.parseBody();
+	const reason = normalizeOverrideReason(form.reason);
+	if (!reason) return c.text("Reopen reason required (3–500 chars).", 400);
+	const toStatus = FIELD_REOPEN_STATUS;
+	await c.env.DB.prepare(
+		`UPDATE jobs SET status = ?, updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(toStatus, id)
+		.run();
+	await recordAudit(c, {
+		action: "job_reopen",
+		entityType: "job",
+		entityId: id,
+		summary: `Reopened field job ${id} (${job.status} → ${toStatus})`,
+		detail: { from: job.status, to: toStatus, reason },
+	});
+	return c.redirect(`/jobs/${id}`);
+});
+
+app.post("/jobs/:id/reassign", async (c) => {
+	const user = c.get("user")!;
+	if (!canOverrideJobAssignment(user)) return c.text("Forbidden", 403);
+	const id = c.req.param("id");
+	const job = await loadFieldJobAccess(c.env.DB, id);
+	if (!job) return c.notFound();
+	if (job.deleted_at) return c.text("Restore from Trash first.", 400);
+	if (!canAccessProduct(user, productForJobType(job.job_type))) {
+		return c.text("Forbidden", 403);
+	}
+	const form = await c.req.parseBody();
+	const nextAssignee = String(form.assigned_user_id || "").trim() || null;
+	if (nextAssignee) {
+		const assignee = await c.env.DB.prepare(
+			`SELECT id, products FROM users WHERE id = ? AND COALESCE(active, 1) = 1`,
+		)
+			.bind(nextAssignee)
+			.first<{ id: string; products: string | null }>();
+		if (!assignee) return c.text("Assignee not found.", 400);
+		if (!parseProducts(assignee.products).includes(productForJobType(job.job_type))) {
+			return c.text("Assignee is not on this product lane.", 400);
+		}
+	}
+	const reasonRaw = String(form.reason || "").trim();
+	const reason =
+		reasonRaw.length > 0 ? normalizeOverrideReason(reasonRaw) : null;
+	if (reasonRaw.length > 0 && !reason) {
+		return c.text("Reassign reason must be 3–500 characters if provided.", 400);
+	}
+	await c.env.DB.prepare(
+		`UPDATE jobs SET assigned_user_id = ?, updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(nextAssignee, id)
+		.run();
+	await recordAudit(c, {
+		action: "job_reassign",
+		entityType: "job",
+		entityId: id,
+		summary: `Reassigned field job ${id}`,
+		detail: {
+			from: job.assigned_user_id,
+			to: nextAssignee,
+			reason: reason ?? null,
+			locked: isStatusLocked(job.status),
+		},
+	});
+	return c.redirect(`/jobs/${id}`);
 });
 
 app.post("/jobs/:id", async (c) => {
@@ -6495,9 +6605,28 @@ app.get("/print/:id", async (c) => {
 
 	const user = c.get("user")!;
 	const isArchived = !!job.deleted_at;
+	const accessJob: PrintJobAccess = {
+		id: job.id,
+		status: job.status,
+		assigned_user_id: job.assigned_user_id,
+		deleted_at: job.deleted_at,
+	};
+	const canWrite = canWritePrintJob(user, accessJob);
+	const canOverride = canOverrideJobAssignment(user);
+	const lockedBanner = isArchived
+		? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This print job is archived (soft-deleted). Restore from Trash to edit.</div>`
+		: !canWrite && canReopenPrintStatus(job.status)
+			? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">${escapeHtml(officeLockBannerCopy("print"))}</div>`
+			: canWrite && canReopenPrintStatus(job.status)
+				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">Print job is delivered. Use <strong>Reopen</strong> below to unlock press edits.</div>`
+				: "";
+
 	const staff = await c.env.DB.prepare(
-		`SELECT id, name, COALESCE(designation, role) AS role FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
-	).all<{ id: string; name: string; role: string }>();
+		`SELECT id, name, COALESCE(designation, role) AS role, products FROM users WHERE COALESCE(active, 1) = 1 ORDER BY name COLLATE NOCASE`,
+	).all<{ id: string; name: string; role: string; products: string | null }>();
+	const staffForPrint =
+		staff.results?.filter((u) => parseProducts(u.products).includes("print")) ??
+		[];
 	const customers = await c.env.DB.prepare(
 		`SELECT id, name FROM customers WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE`,
 	).all<{ id: string; name: string }>();
@@ -6533,12 +6662,21 @@ app.get("/print/:id", async (c) => {
 			`<option value="${p.value}" ${job.product_type === p.value ? "selected" : ""}>${escapeHtml(p.label)}</option>`,
 	).join("");
 	const staffOptions =
-		staff.results
-			?.map(
+		staffForPrint
+			.map(
 				(u) =>
 					`<option value="${escapeHtml(u.id)}" ${job.assigned_user_id === u.id ? "selected" : ""}>${escapeHtml(assigneeOptionLabel(u.name, u.role))}</option>`,
 			)
 			.join("") || "";
+	const overridePanels = renderJobOverridePanels({
+		kind: "print",
+		jobId: id,
+		status: job.status,
+		assignedUserId: job.assigned_user_id,
+		staffOptionsHtml: staffOptions,
+		canOverride,
+		archived: isArchived,
+	});
 	const customerOptions =
 		customers.results
 			?.map(
@@ -6612,11 +6750,8 @@ app.get("/print/:id", async (c) => {
     </div>`;
 
 	const body = `
-    ${
-			isArchived
-				? `<div class="flash" style="background:#fef3c7;border-color:#fcd34d;color:#92400e">This print job is archived (soft-deleted). Restore from Trash to edit.</div>`
-				: ""
-		}
+    ${lockedBanner}
+    ${overridePanels}
     <div class="toolbar">
       <div class="grow">
         <h1 style="margin:0">${escapeHtml(job.title)}</h1>
@@ -6760,6 +6895,85 @@ app.get("/print/:id", async (c) => {
     </form>`;
 
 	return c.html(page(c, job.title, body));
+});
+
+app.post("/print/:id/reopen", async (c) => {
+	const user = c.get("user")!;
+	if (!canReopenJobs(user) || !canAccessProduct(user, "print")) {
+		return c.text("Forbidden", 403);
+	}
+	const id = c.req.param("id");
+	const job = await loadPrintJobAccess(c.env.DB, id);
+	if (!job) return c.notFound();
+	if (job.deleted_at) return c.text("Restore from Trash first.", 400);
+	if (!canReopenPrintStatus(job.status)) {
+		return c.text("Print job is not delivered — nothing to reopen.", 400);
+	}
+	const form = await c.req.parseBody();
+	const reason = normalizeOverrideReason(form.reason);
+	if (!reason) return c.text("Reopen reason required (3–500 chars).", 400);
+	const toStatus = PRINT_REOPEN_STATUS;
+	await c.env.DB.prepare(
+		`UPDATE print_jobs SET status = ?, updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(toStatus, id)
+		.run();
+	await recordAudit(c, {
+		action: "job_reopen",
+		entityType: "print_job",
+		entityId: id,
+		summary: `Reopened print job ${id} (${job.status} → ${toStatus})`,
+		detail: { from: job.status, to: toStatus, reason },
+	});
+	return c.redirect(`/print/${id}`);
+});
+
+app.post("/print/:id/reassign", async (c) => {
+	const user = c.get("user")!;
+	if (!canOverrideJobAssignment(user) || !canAccessProduct(user, "print")) {
+		return c.text("Forbidden", 403);
+	}
+	const id = c.req.param("id");
+	const job = await loadPrintJobAccess(c.env.DB, id);
+	if (!job) return c.notFound();
+	if (job.deleted_at) return c.text("Restore from Trash first.", 400);
+	const form = await c.req.parseBody();
+	const nextAssignee = String(form.assigned_user_id || "").trim() || null;
+	if (nextAssignee) {
+		const assignee = await c.env.DB.prepare(
+			`SELECT id, products FROM users WHERE id = ? AND COALESCE(active, 1) = 1`,
+		)
+			.bind(nextAssignee)
+			.first<{ id: string; products: string | null }>();
+		if (!assignee) return c.text("Assignee not found.", 400);
+		if (!parseProducts(assignee.products).includes("print")) {
+			return c.text("Assignee is not on the Print product lane.", 400);
+		}
+	}
+	const reasonRaw = String(form.reason || "").trim();
+	const reason =
+		reasonRaw.length > 0 ? normalizeOverrideReason(reasonRaw) : null;
+	if (reasonRaw.length > 0 && !reason) {
+		return c.text("Reassign reason must be 3–500 characters if provided.", 400);
+	}
+	await c.env.DB.prepare(
+		`UPDATE print_jobs SET assigned_user_id = ?, updated_at = datetime('now') WHERE id = ?`,
+	)
+		.bind(nextAssignee, id)
+		.run();
+	await recordAudit(c, {
+		action: "job_reassign",
+		entityType: "print_job",
+		entityId: id,
+		summary: `Reassigned print job ${id}`,
+		detail: {
+			from: job.assigned_user_id,
+			to: nextAssignee,
+			reason: reason ?? null,
+			locked: isPrintStatusLocked(job.status),
+		},
+	});
+	return c.redirect(`/print/${id}`);
 });
 
 app.post("/print/:id", async (c) => {

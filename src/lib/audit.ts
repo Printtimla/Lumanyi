@@ -19,7 +19,9 @@ export type AuditAction =
 	| "price_list_reactivate"
 	| "print_margin_update"
 	| "labor_rate_update"
-	| "discount_cap_update";
+	| "discount_cap_update"
+	| "job_reopen"
+	| "job_reassign";
 
 export type AuditEntityType =
 	| "customer"
