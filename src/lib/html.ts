@@ -26,6 +26,89 @@ export function money(cents: number | null | undefined): string {
 	return `$${(cents / 100).toFixed(2)}`;
 }
 
+type NavLink = { href: string; label: string };
+
+function navAnchor(item: NavLink): string {
+	return `<a href="${escapeHtml(item.href)}">${escapeHtml(item.label)}</a>`;
+}
+
+function navDropdown(label: string, items: NavLink[]): string {
+	if (!items.length) return "";
+	const links = items.map(navAnchor).join("");
+	return `<details class="nav-dd">
+    <summary>${escapeHtml(label)}</summary>
+    <div class="nav-dd-menu">${links}</div>
+  </details>`;
+}
+
+/** Primary chrome: flat product/office links + grouped Ops / Admin / Settings. */
+export function buildNavHtml(user: AppUser | null | undefined): string {
+	if (!user) return "";
+
+	const primary: NavLink[] = [{ href: "/", label: "Home" }];
+	if (canAccessProduct(user, "restoration")) {
+		primary.push({ href: "/restoration", label: "Restoration" });
+	}
+	if (canAccessProduct(user, "floors")) {
+		primary.push({ href: "/floors", label: "Floors" });
+	}
+	if (canAccessProduct(user, "print")) {
+		primary.push({ href: "/print", label: "Print" });
+	}
+	if (canSeeOfficeTools(user)) {
+		primary.push({ href: "/customers", label: "Customers" });
+	}
+	primary.push({ href: "/calendar", label: "Calendar" });
+
+	const ops: NavLink[] = [];
+	if (canSeeOfficeTools(user)) {
+		ops.push({ href: "/leads", label: "Leads" });
+		ops.push({ href: "/reports", label: "Reports" });
+	}
+	ops.push({ href: "/inventory", label: "Inventory" });
+	if (canAccessProduct(user, "floors") && canSeeOfficeTools(user)) {
+		ops.push({ href: "/recurring", label: "Recurring" });
+	}
+	if (canAccessProduct(user, "print")) {
+		ops.push({ href: "/print/board", label: "Press board" });
+	}
+
+	const admin: NavLink[] = [];
+	if (canManageUsers(user)) {
+		admin.push({ href: "/users", label: "Users" });
+	}
+	if (canAccessTrash(user)) {
+		admin.push({ href: "/trash", label: "Trash" });
+	}
+	if (canViewAudit(user)) {
+		admin.push({ href: "/audit", label: "Audit" });
+	}
+
+	const settings: NavLink[] = [];
+	if (canManagePriceLists(user)) {
+		settings.push({ href: "/settings/price-lists", label: "Price lists" });
+	}
+	if (canManagePrintMargins(user)) {
+		settings.push({ href: "/settings/print-margins", label: "Print margins" });
+	}
+	if (canManageLaborRates(user)) {
+		settings.push({ href: "/settings/labor-rates", label: "Labor rates" });
+	}
+	if (canManageDiscountCaps(user)) {
+		settings.push({ href: "/settings/discount-caps", label: "Discount caps" });
+	}
+
+	const parts = [
+		...primary.map(navAnchor),
+		navDropdown("Ops", ops),
+		navDropdown("Admin", admin),
+		navDropdown("Settings", settings),
+		navAnchor({ href: "/tech", label: "Tech" }),
+	];
+
+	return parts.filter(Boolean).join("");
+}
+
 export function layout(opts: {
 	title: string;
 	user?: AppUser | null;
@@ -33,67 +116,18 @@ export function layout(opts: {
 	flash?: string | null;
 }): string {
 	const u = opts.user;
-	const items: Array<{ href: string; label: string }> = [];
-	if (u) {
-		items.push({ href: "/", label: "Home" });
-		if (canAccessProduct(u, "restoration")) {
-			items.push({ href: "/restoration", label: "Restoration" });
-		}
-		if (canAccessProduct(u, "floors")) {
-			items.push({ href: "/floors", label: "Floors" });
-		}
-		if (canAccessProduct(u, "print")) {
-			items.push({ href: "/print", label: "Print" });
-		}
-		if (canSeeOfficeTools(u)) {
-			items.push({ href: "/customers", label: "Customers" });
-			items.push({ href: "/leads", label: "Leads" });
-		}
-		items.push({ href: "/calendar", label: "Calendar" });
-		if (canManageUsers(u)) {
-			items.push({ href: "/users", label: "Users" });
-		}
-		if (canAccessTrash(u)) {
-			items.push({ href: "/trash", label: "Trash" });
-			items.push({ href: "/audit", label: "Audit" });
-		}
-		if (canManagePriceLists(u)) {
-			items.push({ href: "/settings/price-lists", label: "Price lists" });
-		}
-		if (canManagePrintMargins(u)) {
-			items.push({ href: "/settings/print-margins", label: "Print margins" });
-		}
-		if (canManageLaborRates(u)) {
-			items.push({ href: "/settings/labor-rates", label: "Labor rates" });
-		}
-		if (canManageDiscountCaps(u)) {
-			items.push({ href: "/settings/discount-caps", label: "Discount caps" });
-		}
-		items.push({ href: "/inventory", label: "Inventory" });
-		if (canSeeOfficeTools(u)) {
-			items.push({ href: "/reports", label: "Reports" });
-		}
-		if (canAccessProduct(u, "floors") && canSeeOfficeTools(u)) {
-			items.push({ href: "/recurring", label: "Recurring" });
-		}
-		if (canAccessProduct(u, "print")) {
-			items.push({ href: "/print/board", label: "Press board" });
-		}
-		items.push({ href: "/tech", label: "Tech" });
-	}
-
-	const nav = items
-		.map((item) => `<a href="${item.href}">${escapeHtml(item.label)}</a>`)
-		.join("");
+	const nav = buildNavHtml(u);
 
 	const userBar = opts.user
-		? `<div class="userbar">
-        <span>${escapeHtml(opts.user.name)} · ${escapeHtml(roleLabel(opts.user.designation || opts.user.role))}</span>
-        <a href="/account/password">Password</a>
-        <form method="post" action="/logout" class="inline">
-          <button type="submit" class="linkish">Log out</button>
-        </form>
-      </div>`
+		? `<details class="nav-dd account-dd">
+        <summary>${escapeHtml(opts.user.name)} · ${escapeHtml(roleLabel(opts.user.designation || opts.user.role))}</summary>
+        <div class="nav-dd-menu">
+          <a href="/account/password">Password</a>
+          <form method="post" action="/logout" class="inline">
+            <button type="submit" class="linkish nav-dd-btn">Log out</button>
+          </form>
+        </div>
+      </details>`
 		: "";
 
 	const flash = opts.flash

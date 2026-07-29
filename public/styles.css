@@ -47,8 +47,79 @@ a:hover { text-decoration: underline; }
   color: var(--ink);
   text-decoration: none;
 }
-.nav { display: flex; gap: 0.9rem; flex: 1; }
-.userbar { display: flex; gap: 0.75rem; align-items: center; color: var(--muted); font-size: 0.9rem; }
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.85rem;
+  flex: 1;
+  align-items: center;
+}
+.nav > a,
+.nav-dd > summary {
+  color: var(--ink);
+  font-size: 0.95rem;
+  text-decoration: none;
+  padding: 0.2rem 0;
+}
+.nav > a:hover,
+.nav-dd > summary:hover {
+  color: var(--accent);
+  text-decoration: none;
+}
+.nav-dd {
+  position: relative;
+}
+.nav-dd > summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+.nav-dd > summary::-webkit-details-marker { display: none; }
+.nav-dd > summary::after {
+  content: " ▾";
+  font-size: 0.75em;
+  color: var(--muted);
+}
+.nav-dd-menu {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  left: 0;
+  min-width: 11rem;
+  padding: 0.4rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(28, 25, 23, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  z-index: 20;
+}
+.account-dd .nav-dd-menu { left: auto; right: 0; }
+.nav-dd-menu a,
+.nav-dd-btn {
+  display: block;
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  color: var(--ink);
+  text-decoration: none;
+  font-size: 0.92rem;
+  text-align: left;
+  width: 100%;
+}
+.nav-dd-menu a:hover,
+.nav-dd-btn:hover {
+  background: #f0fdfa;
+  color: var(--accent);
+  text-decoration: none;
+}
+.nav-dd-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  color: var(--accent);
+}
 .inline { display: inline; margin: 0; }
 .linkish {
   background: none;
@@ -259,5 +330,12 @@ tr:last-child td { border-bottom: none; }
 
 @media (max-width: 640px) {
   .nav { width: 100%; order: 3; }
-  .userbar { margin-left: auto; }
+  .account-dd { margin-left: auto; }
+  .nav-dd-menu {
+    position: static;
+    box-shadow: none;
+    border: none;
+    padding: 0.25rem 0 0.25rem 0.75rem;
+    min-width: 0;
+  }
 }
