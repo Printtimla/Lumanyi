@@ -95,7 +95,7 @@ Skip items marked **external** until the owner asks to connect Cloudflare/GitHub
 
 ## Management spine (MG)
 
-- [x] MG-0: Real `manager` permission role (widen users.role CHECK); Management → manager; product-scoped full visibility; Owner-only Users/Trash/Audit/financial settings unchanged
+- [x] MG-0: Real `manager` permission (app-layer; DB stores dispatcher when CHECK cannot widen on D1); Management → manager; product-scoped full visibility; Owner-only Users/Trash/Audit/financial settings unchanged
 - [x] MG-1: Manager dashboard + bottleneck alerts from existing data
 - [x] MG-2: Reassign / reopen overrides
 - [x] MG-3.1: Field + print invoices (draft → approve → send), PDF, SA-6.4 caps enforced + audit

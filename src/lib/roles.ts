@@ -3,7 +3,7 @@
 import type { ProductKey } from "./products";
 import { ALL_PRODUCTS } from "./access";
 
-/** Login / permission roles (DB CHECK on users.role). */
+/** Login / permission roles (AppUser.role). */
 export const PERMISSION_ROLES = [
 	{ value: "owner", label: "Owner" },
 	{ value: "manager", label: "Manager" },
@@ -13,7 +13,7 @@ export const PERMISSION_ROLES = [
 
 /**
  * Designations shown in Users admin + Assigned to.
- * Management maps to the real manager permission role (MG-0).
+ * Management maps to manager permission (MG-0); DB CHECK may still be owner|dispatcher|tech.
  */
 export const USER_ROLES = [
 	{ value: "owner", label: "Super Admin / Owner" },
@@ -67,8 +67,8 @@ export function isKnownDesignation(role: string): role is AnyDesignation {
 
 /**
  * Resolve AppUser.role from DB role + designation.
- * Prefers role column after MG-0; designation=manager still elevates
- * rows that were stored as dispatcher before migration 0030.
+ * designation=manager elevates even when users.role is still dispatcher
+ * (prod never widened the role CHECK — see migration 0030).
  */
 export function resolvePermissionRole(
 	dbRole: string,
@@ -82,7 +82,7 @@ export function resolvePermissionRole(
 	return "tech";
 }
 
-/** Map designation → permission role stored in users.role. */
+/** Map designation → app permission role. */
 export function permissionRoleFor(
 	designation: string,
 ): PermissionRole {
@@ -90,6 +90,20 @@ export function permissionRoleFor(
 	if (designation === "manager") return "manager";
 	if (designation === "dispatcher") return "dispatcher";
 	return "tech"; // all tech lanes + legacy lead_tech / tech
+}
+
+/**
+ * Value safe for users.role under CHECK (owner|dispatcher|tech).
+ * Manager is stored as dispatcher; designation carries Management.
+ */
+export function dbRoleForStorage(
+	permission: PermissionRole,
+): "owner" | "dispatcher" | "tech" {
+	if (permission === "owner") return "owner";
+	if (permission === "manager" || permission === "dispatcher") {
+		return "dispatcher";
+	}
+	return "tech";
 }
 
 export function defaultProductsForDesignation(

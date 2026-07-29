@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	defaultProductsForDesignation,
+	dbRoleForStorage,
 	LEAST_PRIVILEGE_DESIGNATION,
 	permissionRoleFor,
 	resolvePermissionRole,
@@ -30,6 +31,13 @@ describe("SA-1 designation mapping", () => {
 	it("maps management to manager permission (MG-0)", () => {
 		expect(permissionRoleFor("manager")).toBe("manager");
 		expect(permissionRoleFor("dispatcher")).toBe("dispatcher");
+	});
+
+	it("stores manager as dispatcher for DB CHECK safety", () => {
+		expect(dbRoleForStorage("manager")).toBe("dispatcher");
+		expect(dbRoleForStorage("dispatcher")).toBe("dispatcher");
+		expect(dbRoleForStorage("owner")).toBe("owner");
+		expect(dbRoleForStorage("tech")).toBe("tech");
 	});
 
 	it("defaults least privilege to mitigation tech + restoration", () => {

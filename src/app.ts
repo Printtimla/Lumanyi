@@ -63,6 +63,7 @@ import {
 } from "./lib/products";
 import {
 	assigneeOptionLabel,
+	dbRoleForStorage,
 	defaultProductsForDesignation,
 	isValidUserRole,
 	LEAST_PRIVILEGE_DESIGNATION,
@@ -1206,6 +1207,7 @@ app.post("/users", async (c) => {
 	if (existing) return c.text("Email already exists", 400);
 
 	const permissionRole = permissionRoleFor(designation);
+	const storedRole = dbRoleForStorage(permissionRole);
 	if (permissionRole === "owner") {
 		const seats = await countActiveOwners(c.env.DB);
 		if (seats >= SUPER_ADMIN_SEAT_LIMIT) {
@@ -1233,7 +1235,7 @@ app.post("/users", async (c) => {
 			email,
 			name,
 			passwordHash,
-			permissionRole,
+			storedRole,
 			designation,
 			products,
 		)
@@ -1243,7 +1245,7 @@ app.post("/users", async (c) => {
 		entityType: "user",
 		entityId: newUserId,
 		summary: `Created user ${email} (${designation})`,
-		detail: { email, designation, permissionRole, products },
+		detail: { email, designation, permissionRole, storedRole, products },
 	});
 	return c.redirect("/users");
 });
@@ -1292,6 +1294,7 @@ app.post("/users/:id/designation", async (c) => {
 	if (!row) return c.notFound();
 
 	const nextPermission = permissionRoleFor(rawRole);
+	const storedRole = dbRoleForStorage(nextPermission);
 	const wasOwner = row.role === "owner";
 	const willBeOwner = nextPermission === "owner";
 
@@ -1317,7 +1320,7 @@ app.post("/users/:id/designation", async (c) => {
 	await c.env.DB.prepare(
 		`UPDATE users SET role = ?, designation = ? WHERE id = ?`,
 	)
-		.bind(nextPermission, rawRole, id)
+		.bind(storedRole, rawRole, id)
 		.run();
 	await recordAudit(c, {
 		action: "user_designation",
@@ -1326,7 +1329,11 @@ app.post("/users/:id/designation", async (c) => {
 		summary: `Changed designation ${row.designation} → ${rawRole}`,
 		detail: {
 			before: { designation: row.designation, role: row.role },
-			after: { designation: rawRole, role: nextPermission },
+			after: {
+				designation: rawRole,
+				permissionRole: nextPermission,
+				storedRole,
+			},
 		},
 	});
 	return c.redirect("/users");
